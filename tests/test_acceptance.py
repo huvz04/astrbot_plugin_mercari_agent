@@ -17,6 +17,7 @@ from astrbot_plugin_mercari_agent.domain import (
     CrawlJobState,
     Listing,
     ListingRunState,
+    NotificationState,
     WatchRule,
 )
 from astrbot_plugin_mercari_agent.graph import build_listing_graph
@@ -197,19 +198,9 @@ def test_one_logical_job_retries_then_notifies_exactly_once(app: AcceptanceApp) 
     assert _table_counts(app.repository) == (1, 1, 1)
     assert len(app.notifier.messages) == 1
 
-    repeated_id, created = app.repository.queue_notification(
-        notification.listing_id,
-        notification.watch_rule_id,
-        notification.decision_version,
-        notification.target_session,
-        notification.message_text,
-    )
-
-    assert repeated_id == notification_id
-    assert created is False
+    repeated_notification = app.repository.get_notification(notification_id)
+    assert repeated_notification.id == notification_id
+    assert repeated_notification.state is NotificationState.SENT
     assert _table_counts(app.repository) == (1, 1, 1)
-    with app.repository._sessions() as session:
-        repeated_notification = session.get(NotificationRow, notification_id)
-    assert repeated_notification is not None
     assert repeated_notification.sent_at == sent_at
     assert len(app.notifier.messages) == 1

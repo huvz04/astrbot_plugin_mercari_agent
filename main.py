@@ -19,7 +19,7 @@ from .astrbot_adapters import (
     DeterministicEvaluator,
 )
 from .domain import WatchRule
-from .graph import build_listing_graph
+from .graph import build_listing_graph, recover_notification_outbox
 from .monitor import CrawlService, MockCollector, Monitor
 from .rag import MarkdownChromaRetriever
 from .storage import Repository
@@ -90,6 +90,7 @@ class MercariAgentPlugin(Star):
             self.graph, self.crawl_service = self._build_pipeline(
                 self.evaluator
             )
+            await recover_notification_outbox(repository, self.notifier)
             self.watch_rule = self._build_watch_rule(self._target_session)
 
             if not self._use_mock_collector:
@@ -196,9 +197,13 @@ class MercariAgentPlugin(Star):
                 _, crawl_service = self._build_pipeline(session_evaluator)
         job_id = await crawl_service.run_once(test_rule)
         job = self.repository.get_job(job_id)
-        sent = self.repository.count_sent_notifications(test_rule.id) > 0
-        sent_text = "已发送" if sent else "未发送"
-        return f"测试 Job #{job_id}：{job.state.value}；通知：{sent_text}"
+        dispatched = (
+            self.repository.count_dispatched_notifications(test_rule.id) > 0
+        )
+        dispatch_text = "已提交平台" if dispatched else "未提交平台"
+        return (
+            f"测试 Job #{job_id}：{job.state.value}；通知：{dispatch_text}"
+        )
 
     @filter.command("煤炉监控")
     async def command_monitor(

@@ -344,7 +344,7 @@ def test_queue_failure_fails_process_run_without_rewinding_successful_crawl(
     def fail_queue(*args: object, **kwargs: object) -> tuple[int, bool]:
         raise RuntimeError("Authorization: Bearer private-token")
 
-    monkeypatch.setattr(repository, "queue_notification", fail_queue)
+    monkeypatch.setattr(repository, "queue_notification_for_run", fail_queue)
     service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
 
     job_id = asyncio.run(service.run_once(rule))

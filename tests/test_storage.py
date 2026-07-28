@@ -12,6 +12,7 @@ from astrbot_plugin_mercari_agent.domain import (
     CrawlJobState,
     Listing,
     ListingRunState,
+    NotificationState,
     TransitionError,
 )
 from astrbot_plugin_mercari_agent.storage import (
@@ -64,26 +65,35 @@ def test_listing_unique_key_is_durable(repository, listing) -> None:
     assert second_created is False
 
 
-def test_exact_job_and_sent_notification_queries_are_scoped(
+def test_exact_job_and_dispatched_notification_queries_are_scoped(
     repository, listing
 ) -> None:
     first_job_id = repository.create_job("rule-test")
     second_job_id = repository.create_job("rule-other")
     listing_id, _ = repository.save_listing(listing)
-    notification_id, _ = repository.queue_notification(
-        listing_id,
-        "rule-test",
-        "mercari-v1",
-        "aiocqhttp:group:123",
-        "message",
+    run_id, _ = repository.get_or_create_listing_run(listing_id, "rule-test")
+    for state in (
+        ListingRunState.NORMALIZED,
+        ListingRunState.DEDUP_CHECKED,
+        ListingRunState.RULE_EVALUATED,
+        ListingRunState.RAG_RETRIEVED,
+        ListingRunState.AGENT_EVALUATED,
+    ):
+        repository.advance_listing_run(run_id, state)
+    notification_id, _ = repository.queue_notification_for_run(
+        run_id,
+        decision_version="mercari-v1",
+        target_session="aiocqhttp:group:123",
+        message_text="message",
     )
 
     assert repository.get_job(first_job_id).id == first_job_id
     assert repository.get_job(second_job_id).id == second_job_id
-    assert repository.count_sent_notifications("rule-test") == 0
-    repository.mark_notification_sent(notification_id)
-    assert repository.count_sent_notifications("rule-test") == 1
-    assert repository.count_sent_notifications("rule-other") == 0
+    assert repository.count_dispatched_notifications("rule-test") == 0
+    repository.claim_notification(notification_id)
+    repository.finalize_notification_sent(notification_id)
+    assert repository.count_dispatched_notifications("rule-test") == 1
+    assert repository.count_dispatched_notifications("rule-other") == 0
 
 
 def test_illegal_attempt_transition_leaves_stored_state_unchanged(repository) -> None:
@@ -475,6 +485,18 @@ def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> N
                 created_at DATETIME NOT NULL,
                 CONSTRAINT uq_listing_run_rule UNIQUE (listing_id, watch_rule_id)
             );
+            CREATE TABLE notifications (
+                id INTEGER PRIMARY KEY,
+                listing_id INTEGER NOT NULL,
+                watch_rule_id VARCHAR NOT NULL,
+                decision_version VARCHAR NOT NULL,
+                target_session VARCHAR NOT NULL,
+                message_text VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL,
+                sent_at DATETIME,
+                CONSTRAINT uq_notification_idempotency
+                    UNIQUE (listing_id, watch_rule_id, decision_version)
+            );
             INSERT INTO listings VALUES (
                 1, 'mercari', 'legacy-1', 'legacy', '', 100,
                 'https://example.invalid/legacy-1', NULL, NULL, NULL,
@@ -482,6 +504,15 @@ def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> N
             );
             INSERT INTO listing_process_runs VALUES (
                 1, 1, 'rule-1', 'FAILED', 'temporary', '2026-01-01 00:00:00'
+            );
+            INSERT INTO notifications VALUES (
+                1, 1, 'rule-1', 'legacy-unsent',
+                'aiocqhttp:group:1', 'message', '2026-01-01 00:00:00', NULL
+            );
+            INSERT INTO notifications VALUES (
+                2, 1, 'rule-1', 'legacy-sent',
+                'aiocqhttp:group:1', 'message', '2026-01-01 00:00:00',
+                '2026-01-01 00:01:00'
             );
             """
         )
@@ -493,6 +524,12 @@ def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> N
     try:
         legacy = repository.get_listing_run(1)
         assert legacy.run_no == 1
+        assert (
+            repository.get_notification(1).state
+            is NotificationState.VERIFY_REQUIRED
+        )
+        assert repository.get_notification(1).process_run_id == 1
+        assert repository.get_notification(2).state is NotificationState.SENT
         second_id, created = repository.get_or_create_listing_run(1, "rule-1")
         assert created is True
         assert repository.get_listing_run(second_id).run_no == 2
@@ -503,6 +540,11 @@ def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> N
     try:
         assert reopened.get_listing_run(1).run_no == 1
         assert reopened.get_listing_run(2).run_no == 2
+        assert (
+            reopened.get_notification(1).state
+            is NotificationState.VERIFY_REQUIRED
+        )
+        assert reopened.get_notification(2).state is NotificationState.SENT
         with reopened._engine.connect() as engine_connection:
             columns = {
                 row[1]

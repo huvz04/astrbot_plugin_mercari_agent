@@ -203,6 +203,7 @@ def test_notifier_uses_exact_target_and_one_plain_chain(send_result: bool) -> No
     assert len(chain.chain) == 1
     assert isinstance(chain.chain[0], _Plain)
     assert chain.chain[0].text == "hello"
+    assert notifier.successful_dispatches == int(send_result)
 
 
 def test_deterministic_embeddings_are_stable_across_instances() -> None:
@@ -344,6 +345,15 @@ def _patch_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         lambda *args, **kwargs: DummyRetriever(),
     )
 
+    async def recover_notification_outbox(repository, notifier) -> None:
+        return None
+
+    monkeypatch.setattr(
+        plugin_main,
+        "recover_notification_outbox",
+        recover_notification_outbox,
+    )
+
 
 def test_initialize_with_real_collector_mode_creates_no_monitor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -462,6 +472,29 @@ def test_provider_absence_selects_deterministic_fallbacks(
     asyncio.run(plugin.terminate())
 
 
+def test_initialize_recovers_persisted_notification_outbox_before_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    recovered: list[tuple[object, object]] = []
+
+    async def record_recovery(repository, notifier) -> None:
+        recovered.append((repository, notifier))
+
+    monkeypatch.setattr(
+        plugin_main,
+        "recover_notification_outbox",
+        record_recovery,
+    )
+    plugin = MercariAgentPlugin(FakeContext(), {})
+
+    asyncio.run(plugin.initialize())
+
+    assert recovered == [(plugin.repository, plugin.notifier)]
+    asyncio.run(plugin.terminate())
+
+
 def test_blank_target_test_uses_event_session_chat_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -525,7 +558,7 @@ def test_offline_fallback_test_command_runs_end_to_end(
     result = asyncio.run(exercise())
 
     assert "SUCCEEDED" in result[0]
-    assert "已发送" in result[0]
+    assert "已提交平台" in result[0]
     assert context.sent[0][0] == "aiocqhttp:group:offline"
 
 
@@ -554,7 +587,7 @@ class FakeCrawlService:
 
     async def run_once(self, rule) -> int:
         self.rules.append(rule)
-        self.notifier.successful_sends += 1
+        self.notifier.successful_dispatches += 1
         return 7
 
 
@@ -570,13 +603,13 @@ class FakeRepository:
         self.requested_job_ids.append(job_id)
         return SimpleNamespace(id=job_id, state=CrawlJobState.SUCCEEDED)
 
-    def count_sent_notifications(self, watch_rule_id: str) -> int:
+    def count_dispatched_notifications(self, watch_rule_id: str) -> int:
         self.requested_rule_ids.append(watch_rule_id)
         return 1
 
 
 class FakeNotifier:
-    successful_sends = 1
+    successful_dispatches = 1
 
 
 def test_concurrent_test_commands_are_serialized() -> None:
@@ -622,7 +655,7 @@ def test_test_command_falls_back_to_event_unified_msg_origin() -> None:
     plugin = MercariAgentPlugin(FakeContext(), {"target_session": ""})
     plugin.watch_rule = plugin._build_watch_rule("")
     plugin.notifier = FakeNotifier()
-    plugin.notifier.successful_sends = 0
+    plugin.notifier.successful_dispatches = 0
     plugin.crawl_service = FakeCrawlService(plugin.notifier)
     repository = FakeRepository()
     plugin.repository = repository
@@ -635,7 +668,7 @@ def test_test_command_falls_back_to_event_unified_msg_origin() -> None:
     assert repository.requested_job_ids == [7]
     assert repository.requested_rule_ids == [plugin.crawl_service.rules[0].id]
     assert "SUCCEEDED" in result[0]
-    assert "已发送" in result[0]
+    assert "已提交平台" in result[0]
 
 
 @pytest.mark.parametrize("price", ["not-a-number", "-1"])

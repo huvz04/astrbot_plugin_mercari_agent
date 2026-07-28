@@ -23,23 +23,23 @@ T = TypeVar("T")
 
 
 class AstrBotNotifier:
-    """Send a single plain AstrBot message and retain no delivery secrets."""
+    """Submit one plain message to a matching AstrBot platform."""
 
     def __init__(self, context: Context) -> None:
         self.context = context
-        self.successful_sends = 0
+        self.successful_dispatches = 0
 
     async def send(self, target_session: str, text: str) -> bool:
-        sent = (
+        accepted = (
             await self.context.send_message(
                 target_session,
                 MessageChain([Plain(text)]),
             )
             is True
         )
-        if sent:
-            self.successful_sends += 1
-        return sent
+        if accepted:
+            self.successful_dispatches += 1
+        return accepted
 
 
 class AstrBotEvaluator:

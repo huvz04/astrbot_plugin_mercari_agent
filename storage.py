@@ -16,10 +16,12 @@ from .domain import (
     ATTEMPT_TRANSITIONS,
     JOB_TRANSITIONS,
     LISTING_RUN_TRANSITIONS,
+    NOTIFICATION_TRANSITIONS,
     CrawlAttemptState,
     CrawlJobState,
     Listing,
     ListingRunState,
+    NotificationState,
     assert_transition,
 )
 
@@ -196,10 +198,16 @@ class NotificationRow(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
     decision_version: Mapped[str] = mapped_column(String, nullable=False)
+    process_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("listing_process_runs.id")
+    )
     target_session: Mapped[str] = mapped_column(String, nullable=False)
     message_text: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    attempt_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    last_error: Mapped[str | None] = mapped_column(String)
 
 
 @dataclass(frozen=True)
@@ -248,6 +256,22 @@ class ListingProcessRun:
 
 
 @dataclass(frozen=True)
+class Notification:
+    id: int
+    listing_id: int
+    watch_rule_id: str
+    decision_version: str
+    process_run_id: int | None
+    target_session: str
+    message_text: str
+    state: NotificationState
+    created_at: datetime
+    attempt_at: datetime | None
+    sent_at: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
 class StatusSnapshot:
     job_state: CrawlJobState | None
     attempt_count: int
@@ -284,6 +308,7 @@ class Repository:
         repository = cls(engine)
         repository._migrate_attempt_updated_at()
         repository._migrate_listing_run_sequence()
+        repository._migrate_notification_outbox()
         repository._migrate_unfinished_attempt_index()
         return repository
 
@@ -369,6 +394,53 @@ class Repository:
                 text(
                     "ALTER TABLE listing_process_runs_v2 "
                     "RENAME TO listing_process_runs"
+                )
+            )
+
+    def _migrate_notification_outbox(self) -> None:
+        """Add conservative delivery state to legacy notification rows."""
+        with self._engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    text("PRAGMA table_info('notifications')")
+                )
+            }
+            additions = {
+                "process_run_id": "INTEGER REFERENCES listing_process_runs (id)",
+                "state": "VARCHAR",
+                "attempt_at": "DATETIME",
+                "last_error": "VARCHAR",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE notifications "
+                            f"ADD COLUMN {name} {definition}"
+                        )
+                    )
+            connection.execute(
+                text(
+                    "UPDATE notifications "
+                    "SET process_run_id = ("
+                    "  SELECT listing_process_runs.id "
+                    "  FROM listing_process_runs "
+                    "  WHERE listing_process_runs.listing_id = notifications.listing_id "
+                    "    AND listing_process_runs.watch_rule_id = notifications.watch_rule_id "
+                    "  ORDER BY listing_process_runs.run_no DESC "
+                    "  LIMIT 1"
+                    ") "
+                    "WHERE process_run_id IS NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE notifications "
+                    "SET state = CASE "
+                    "WHEN sent_at IS NOT NULL THEN 'SENT' "
+                    "ELSE 'VERIFY_REQUIRED' END "
+                    "WHERE state IS NULL"
                 )
             )
 
@@ -675,65 +747,296 @@ class Repository:
                 updated_at=row.updated_at,
             )
 
-    def queue_notification(
+    def queue_notification_for_run(
         self,
-        listing_id: int,
-        watch_rule_id: str,
+        run_id: int,
+        *,
         decision_version: str,
         target_session: str,
         message_text: str,
     ) -> tuple[int, bool]:
-        key_filter = (
-            NotificationRow.listing_id == listing_id,
-            NotificationRow.watch_rule_id == watch_rule_id,
-            NotificationRow.decision_version == decision_version,
-        )
+        """Atomically queue/requeue an idempotent notification and its run."""
         try:
             with self._sessions.begin() as session:
+                run = session.get(ListingProcessRunRow, run_id)
+                if run is None:
+                    raise KeyError(f"listing process run {run_id} does not exist")
+                run_state = ListingRunState(run.state)
+                if run_state is not ListingRunState.AGENT_EVALUATED:
+                    raise ConcurrentStateChange(
+                        f"listing process run {run_id} is not ready to queue"
+                    )
+                key_filter = (
+                    NotificationRow.listing_id == run.listing_id,
+                    NotificationRow.watch_rule_id == run.watch_rule_id,
+                    NotificationRow.decision_version == decision_version,
+                )
                 existing = session.scalar(
                     select(NotificationRow).where(*key_filter)
                 )
-                if existing is not None:
-                    return existing.id, False
-                row = NotificationRow(
-                    listing_id=listing_id,
-                    watch_rule_id=watch_rule_id,
-                    decision_version=decision_version,
-                    target_session=target_session,
-                    message_text=message_text,
-                    created_at=_utc_now(),
+                now = _utc_now()
+                if existing is None:
+                    notification = NotificationRow(
+                        listing_id=run.listing_id,
+                        watch_rule_id=run.watch_rule_id,
+                        decision_version=decision_version,
+                        process_run_id=run.id,
+                        target_session=target_session,
+                        message_text=message_text,
+                        state=NotificationState.QUEUED.value,
+                        created_at=now,
+                    )
+                    session.add(notification)
+                    session.flush()
+                else:
+                    notification = existing
+                    notification_state = NotificationState(notification.state)
+                    if notification_state not in {
+                        NotificationState.FAILED_KNOWN,
+                        NotificationState.QUEUED,
+                    }:
+                        diagnostic = (
+                            "notification verification required"
+                            if notification_state
+                            in {
+                                NotificationState.SENDING,
+                                NotificationState.VERIFY_REQUIRED,
+                            }
+                            else "notification already dispatched"
+                        )
+                        failed = session.execute(
+                            update(ListingProcessRunRow)
+                            .where(
+                                ListingProcessRunRow.id == run.id,
+                                ListingProcessRunRow.state
+                                == ListingRunState.AGENT_EVALUATED.value,
+                            )
+                            .values(
+                                state=ListingRunState.FAILED.value,
+                                error_summary=diagnostic,
+                                updated_at=now,
+                            )
+                        )
+                        if failed.rowcount != 1:
+                            raise ConcurrentStateChange(
+                                f"listing process run {run.id} changed concurrently"
+                            )
+                        return notification.id, False
+                    if notification_state is NotificationState.FAILED_KNOWN:
+                        assert_transition(
+                            notification_state,
+                            NotificationState.QUEUED,
+                            NOTIFICATION_TRANSITIONS,
+                        )
+                    requeued = session.execute(
+                        update(NotificationRow)
+                        .where(
+                            NotificationRow.id == notification.id,
+                            NotificationRow.state == notification.state,
+                        )
+                        .values(
+                            process_run_id=run.id,
+                            target_session=target_session,
+                            message_text=message_text,
+                            state=NotificationState.QUEUED.value,
+                            attempt_at=None,
+                            sent_at=None,
+                            last_error=None,
+                        )
+                    )
+                    if requeued.rowcount != 1:
+                        raise ConcurrentStateChange(
+                            f"notification {notification.id} changed concurrently"
+                        )
+                queued = session.execute(
+                    update(ListingProcessRunRow)
+                    .where(
+                        ListingProcessRunRow.id == run.id,
+                        ListingProcessRunRow.state
+                        == ListingRunState.AGENT_EVALUATED.value,
+                    )
+                    .values(
+                        state=ListingRunState.NOTIFICATION_QUEUED.value,
+                        error_summary=None,
+                        updated_at=now,
+                    )
                 )
-                session.add(row)
-                session.flush()
-                return row.id, True
+                if queued.rowcount != 1:
+                    raise ConcurrentStateChange(
+                        f"listing process run {run.id} changed concurrently"
+                    )
+                return notification.id, True
         except IntegrityError:
             with self._sessions() as session:
+                run = session.get(ListingProcessRunRow, run_id)
+                if run is None:
+                    raise
                 existing = session.scalar(
-                    select(NotificationRow).where(*key_filter)
+                    select(NotificationRow).where(
+                        NotificationRow.listing_id == run.listing_id,
+                        NotificationRow.watch_rule_id == run.watch_rule_id,
+                        NotificationRow.decision_version == decision_version,
+                    )
                 )
                 if existing is None:
                     raise
                 return existing.id, False
 
-    def mark_notification_sent(self, notification_id: int) -> None:
+    def claim_notification(self, notification_id: int) -> Notification | None:
         with self._sessions.begin() as session:
             row = session.get(NotificationRow, notification_id)
             if row is None:
                 raise KeyError(f"notification {notification_id} does not exist")
-            if row.sent_at is not None:
-                return
+            current = NotificationState(row.state)
+            if current is not NotificationState.QUEUED:
+                return None
+            assert_transition(
+                current,
+                NotificationState.SENDING,
+                NOTIFICATION_TRANSITIONS,
+            )
             updated = session.execute(
                 update(NotificationRow)
                 .where(
                     NotificationRow.id == notification_id,
-                    NotificationRow.sent_at.is_(None),
+                    NotificationRow.state == NotificationState.QUEUED.value,
                 )
-                .values(sent_at=_utc_now())
+                .values(
+                    state=NotificationState.SENDING.value,
+                    attempt_at=_utc_now(),
+                    last_error=None,
+                )
             )
             if updated.rowcount != 1:
                 raise ConcurrentStateChange(
                     f"notification {notification_id} changed concurrently"
                 )
+        return self.get_notification(notification_id)
+
+    def finalize_notification_sent(self, notification_id: int) -> None:
+        self._finalize_notification(
+            notification_id,
+            NotificationState.SENT,
+            ListingRunState.NOTIFIED,
+            error=None,
+        )
+
+    def finalize_notification_known_failure(
+        self,
+        notification_id: int,
+        error: object,
+    ) -> None:
+        self._finalize_notification(
+            notification_id,
+            NotificationState.FAILED_KNOWN,
+            ListingRunState.FAILED,
+            error=error,
+        )
+
+    def mark_notification_verify_required(
+        self,
+        notification_id: int,
+        error: object,
+    ) -> None:
+        self._finalize_notification(
+            notification_id,
+            NotificationState.VERIFY_REQUIRED,
+            ListingRunState.FAILED,
+            error=error,
+        )
+
+    def _finalize_notification(
+        self,
+        notification_id: int,
+        target: NotificationState,
+        run_target: ListingRunState,
+        *,
+        error: object,
+    ) -> None:
+        sanitized_error = _sanitize_error_summary(error)
+        with self._sessions.begin() as session:
+            notification = session.get(NotificationRow, notification_id)
+            if notification is None:
+                raise KeyError(f"notification {notification_id} does not exist")
+            current = NotificationState(notification.state)
+            if current is target:
+                return
+            assert_transition(current, target, NOTIFICATION_TRANSITIONS)
+            if notification.process_run_id is None:
+                raise ConcurrentStateChange(
+                    f"notification {notification_id} has no process run"
+                )
+            run = session.get(
+                ListingProcessRunRow,
+                notification.process_run_id,
+            )
+            if run is None:
+                raise KeyError(
+                    f"listing process run {notification.process_run_id} does not exist"
+                )
+            current_run = ListingRunState(run.state)
+            assert_transition(current_run, run_target, LISTING_RUN_TRANSITIONS)
+            now = _utc_now()
+            notification_update = session.execute(
+                update(NotificationRow)
+                .where(
+                    NotificationRow.id == notification.id,
+                    NotificationRow.state == NotificationState.SENDING.value,
+                )
+                .values(
+                    state=target.value,
+                    sent_at=now if target is NotificationState.SENT else None,
+                    last_error=sanitized_error,
+                )
+            )
+            run_update = session.execute(
+                update(ListingProcessRunRow)
+                .where(
+                    ListingProcessRunRow.id == run.id,
+                    ListingProcessRunRow.state == current_run.value,
+                )
+                .values(
+                    state=run_target.value,
+                    error_summary=sanitized_error,
+                    updated_at=now,
+                )
+            )
+            if notification_update.rowcount != 1 or run_update.rowcount != 1:
+                raise ConcurrentStateChange(
+                    f"notification {notification_id} changed concurrently"
+                )
+
+    def reconcile_sending_notifications(self) -> None:
+        with self._sessions() as session:
+            ids = list(
+                session.scalars(
+                    select(NotificationRow.id).where(
+                        NotificationRow.state
+                        == NotificationState.SENDING.value
+                    )
+                )
+            )
+        for notification_id in ids:
+            self.mark_notification_verify_required(
+                notification_id,
+                "dispatch result unknown after restart",
+            )
+
+    def queued_notifications(self) -> list[Notification]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(NotificationRow)
+                .where(NotificationRow.state == NotificationState.QUEUED.value)
+                .order_by(NotificationRow.id)
+            )
+            return [self._notification_value(row) for row in rows]
+
+    def get_notification(self, notification_id: int) -> Notification:
+        with self._sessions() as session:
+            row = session.get(NotificationRow, notification_id)
+            if row is None:
+                raise KeyError(f"notification {notification_id} does not exist")
+            return self._notification_value(row)
 
     def count_notifications(self) -> int:
         with self._sessions() as session:
@@ -762,7 +1065,7 @@ class Repository:
                 state=CrawlJobState(row.state),
             )
 
-    def count_sent_notifications(self, watch_rule_id: str) -> int:
+    def count_dispatched_notifications(self, watch_rule_id: str) -> int:
         with self._sessions() as session:
             return (
                 session.scalar(
@@ -770,11 +1073,15 @@ class Repository:
                     .select_from(NotificationRow)
                     .where(
                         NotificationRow.watch_rule_id == watch_rule_id,
-                        NotificationRow.sent_at.is_not(None),
+                        NotificationRow.state == NotificationState.SENT.value,
                     )
                 )
                 or 0
             )
+
+    def count_sent_notifications(self, watch_rule_id: str) -> int:
+        """Compatibility alias; user-facing callers should say dispatched."""
+        return self.count_dispatched_notifications(watch_rule_id)
 
     def attempts(self, job_id: int) -> list[CrawlAttempt]:
         with self._sessions() as session:
@@ -855,4 +1162,21 @@ class Repository:
             started_at=row.started_at,
             finished_at=row.finished_at,
             updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _notification_value(row: NotificationRow) -> Notification:
+        return Notification(
+            id=row.id,
+            listing_id=row.listing_id,
+            watch_rule_id=row.watch_rule_id,
+            decision_version=row.decision_version,
+            process_run_id=row.process_run_id,
+            target_session=row.target_session,
+            message_text=row.message_text,
+            state=NotificationState(row.state),
+            created_at=row.created_at,
+            attempt_at=row.attempt_at,
+            sent_at=row.sent_at,
+            last_error=row.last_error,
         )

@@ -40,6 +40,14 @@ class ListingRunState(StrEnum):
     FAILED = "FAILED"
 
 
+class NotificationState(StrEnum):
+    QUEUED = "QUEUED"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    FAILED_KNOWN = "FAILED_KNOWN"
+    VERIFY_REQUIRED = "VERIFY_REQUIRED"
+
+
 JOB_TRANSITIONS: dict[CrawlJobState, frozenset[CrawlJobState]] = {
     CrawlJobState.PENDING: frozenset({CrawlJobState.ACTIVE}),
     CrawlJobState.ACTIVE: frozenset(
@@ -103,6 +111,20 @@ LISTING_RUN_TRANSITIONS: dict[ListingRunState, frozenset[ListingRunState]] = {
     ),
     ListingRunState.NOTIFIED: frozenset(),
     ListingRunState.FAILED: frozenset(),
+}
+
+NOTIFICATION_TRANSITIONS: dict[NotificationState, frozenset[NotificationState]] = {
+    NotificationState.QUEUED: frozenset({NotificationState.SENDING}),
+    NotificationState.SENDING: frozenset(
+        {
+            NotificationState.SENT,
+            NotificationState.FAILED_KNOWN,
+            NotificationState.VERIFY_REQUIRED,
+        }
+    ),
+    NotificationState.FAILED_KNOWN: frozenset({NotificationState.QUEUED}),
+    NotificationState.SENT: frozenset(),
+    NotificationState.VERIFY_REQUIRED: frozenset(),
 }
 
 

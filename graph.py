@@ -8,7 +8,13 @@ from typing import Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .domain import AgentDecision, Listing, ListingRunState, WatchRule
+from .domain import (
+    AgentDecision,
+    Listing,
+    ListingRunState,
+    NotificationState,
+    WatchRule,
+)
 from .filters import FilterResult, evaluate_rule, normalize_listing
 from .rag import Evidence
 from .storage import Repository
@@ -42,6 +48,77 @@ class ListingGraphState(TypedDict, total=False):
     notification_id: int
     notification_created: bool
     errors: list[str]
+
+
+async def dispatch_notification(
+    repository: Repository,
+    notifier: Notifier,
+    notification_id: int,
+) -> NotificationState:
+    """Claim and finalize one persisted notification without blind resends."""
+    try:
+        notification = repository.claim_notification(notification_id)
+    except Exception:
+        return repository.get_notification(notification_id).state
+    if notification is None:
+        return repository.get_notification(notification_id).state
+
+    try:
+        accepted = await notifier.send(
+            notification.target_session,
+            notification.message_text,
+        )
+    except asyncio.CancelledError:
+        try:
+            repository.mark_notification_verify_required(
+                notification_id,
+                "dispatch cancelled with unknown result",
+            )
+        finally:
+            raise
+    except Exception as error:
+        repository.mark_notification_verify_required(notification_id, str(error))
+        return NotificationState.VERIFY_REQUIRED
+
+    if accepted:
+        try:
+            repository.finalize_notification_sent(notification_id)
+            return NotificationState.SENT
+        except Exception as error:
+            try:
+                repository.mark_notification_verify_required(
+                    notification_id,
+                    str(error),
+                )
+            except Exception:
+                pass
+            return repository.get_notification(notification_id).state
+
+    try:
+        repository.finalize_notification_known_failure(
+            notification_id,
+            "notification send returned false",
+        )
+        return NotificationState.FAILED_KNOWN
+    except Exception as error:
+        try:
+            repository.mark_notification_verify_required(
+                notification_id,
+                str(error),
+            )
+        except Exception:
+            pass
+        return repository.get_notification(notification_id).state
+
+
+async def recover_notification_outbox(
+    repository: Repository,
+    notifier: Notifier,
+) -> None:
+    """Conservatively reconcile uncertain sends, then dispatch safe queued work."""
+    repository.reconcile_sending_notifications()
+    for notification in repository.queued_notifications():
+        await dispatch_notification(repository, notifier, notification.id)
 
 
 def _notification_message(
@@ -197,45 +274,32 @@ def build_listing_graph(
             state["agent_decision"],
             state["retrieved_documents"],
         )
-        notification_id, created = repository.queue_notification(
-            state["listing_id"],
-            state["watch_rule"].id,
-            state["agent_decision"].prompt_version,
-            state["watch_rule"].target_session,
-            message,
+        notification_id, created = repository.queue_notification_for_run(
+            state["process_run_id"],
+            decision_version=state["agent_decision"].prompt_version,
+            target_session=state["watch_rule"].target_session,
+            message_text=message,
         )
-        if created:
-            repository.advance_listing_run(
-                state["process_run_id"],
-                ListingRunState.NOTIFICATION_QUEUED,
-            )
         return {
             "notification_id": notification_id,
             "notification_created": created,
         }
 
     async def notify_node(state: ListingGraphState) -> ListingGraphState:
-        sent = await notifier.send(
-            state["watch_rule"].target_session,
-            _notification_message(
-                state["listing"],
-                state["agent_decision"],
-                state["retrieved_documents"],
-            ),
+        dispatch_state = await dispatch_notification(
+            repository,
+            notifier,
+            state["notification_id"],
         )
-        if not sent:
-            error = "notification send returned false"
-            repository.advance_listing_run(
-                state["process_run_id"],
-                ListingRunState.FAILED,
-                error_summary=error,
+        if dispatch_state is not NotificationState.SENT:
+            notification = repository.get_notification(
+                state["notification_id"]
+            )
+            error = (
+                notification.last_error
+                or f"notification dispatch ended in {dispatch_state.value}"
             )
             return {"errors": [*state.get("errors", ()), error]}
-        repository.mark_notification_sent(state["notification_id"])
-        repository.advance_listing_run(
-            state["process_run_id"],
-            ListingRunState.NOTIFIED,
-        )
         return {}
 
     builder = StateGraph(ListingGraphState)
