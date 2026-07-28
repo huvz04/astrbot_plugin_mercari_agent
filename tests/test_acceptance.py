@@ -174,6 +174,8 @@ def test_one_logical_job_retries_then_notifies_exactly_once(app: AcceptanceApp) 
     assert ListingRunState(process_run.state) is ListingRunState.NOTIFIED
     assert notification is not None
     assert notification.sent_at is not None
+    notification_id = notification.id
+    sent_at = notification.sent_at
 
     assert len(app.notifier.messages) == 1
     _, message = app.notifier.messages[0]
@@ -193,4 +195,21 @@ def test_one_logical_job_retries_then_notifies_exactly_once(app: AcceptanceApp) 
     asyncio.run(app.graph.ainvoke({"listing": listing, "watch_rule": app.rule}))
 
     assert _table_counts(app.repository) == (1, 1, 1)
+    assert len(app.notifier.messages) == 1
+
+    repeated_id, created = app.repository.queue_notification(
+        notification.listing_id,
+        notification.watch_rule_id,
+        notification.decision_version,
+        notification.target_session,
+        notification.message_text,
+    )
+
+    assert repeated_id == notification_id
+    assert created is False
+    assert _table_counts(app.repository) == (1, 1, 1)
+    with app.repository._sessions() as session:
+        repeated_notification = session.get(NotificationRow, notification_id)
+    assert repeated_notification is not None
+    assert repeated_notification.sent_at == sent_at
     assert len(app.notifier.messages) == 1
