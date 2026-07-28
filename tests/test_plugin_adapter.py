@@ -263,6 +263,32 @@ def test_evaluator_rejects_malformed_or_prose_wrapped_output() -> None:
         asyncio.run(AstrBotEvaluator(provider).evaluate(_listing(), []))
 
 
+@pytest.mark.parametrize(
+    "payload_update",
+    [
+        {"unexpected": "must be rejected"},
+        {"score": "91"},
+    ],
+)
+def test_evaluator_rejects_extra_fields_and_type_coercion(
+    payload_update: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "score": 91,
+        "recommendation": "HIGH_PRIORITY",
+        "reasons": ["under budget"],
+        "risks": [],
+        "retrieved_evidence": ["aliases"],
+        "model_name": "untrusted-output",
+        "prompt_version": "untrusted-output",
+    }
+    payload.update(payload_update)
+    provider = FakeChatProvider(json.dumps(payload))
+
+    with pytest.raises(ValidationError):
+        asyncio.run(AstrBotEvaluator(provider).evaluate(_listing(), []))
+
+
 def test_deterministic_evaluator_uses_risk_evidence_stably() -> None:
     from astrbot_plugin_mercari_agent.rag import Evidence
 
@@ -296,10 +322,12 @@ class RecordingMonitor:
         RecordingMonitor.instances.append(self)
 
     async def start(self) -> None:
+        await asyncio.sleep(0)
         self.start_calls += 1
         self.running = True
 
     async def stop(self) -> None:
+        await asyncio.sleep(0)
         self.stop_calls += 1
         self.running = False
 
@@ -357,6 +385,71 @@ def test_enabled_target_starts_only_from_initialize(
     asyncio.run(plugin.terminate())
 
 
+def test_concurrent_repeated_initialize_creates_one_repository_and_monitor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+
+    class DisposableRepository:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    repositories: list[DisposableRepository] = []
+
+    class CountingRepository:
+        @classmethod
+        def open(cls, path: Path) -> DisposableRepository:
+            repository = DisposableRepository()
+            repositories.append(repository)
+            return repository
+
+    monkeypatch.setattr(plugin_main, "Repository", CountingRepository)
+    plugin = MercariAgentPlugin(FakeContext(), {})
+
+    async def exercise() -> None:
+        await asyncio.gather(plugin.initialize(), plugin.initialize())
+        await plugin.initialize()
+        assert len(repositories) == 1
+        assert len(RecordingMonitor.instances) == 1
+        await plugin.terminate()
+        await plugin.terminate()
+
+    asyncio.run(exercise())
+
+    assert repositories[0].dispose_calls == 1
+    assert RecordingMonitor.instances[0].stop_calls == 1
+
+
+def test_concurrent_monitor_replacements_leave_no_orphan_after_terminate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    plugin = MercariAgentPlugin(FakeContext(), {})
+
+    async def exercise() -> None:
+        await plugin.initialize()
+        first = _results(
+            plugin.command_monitor(
+                FakeEvent("aiocqhttp:group:first"), "月村手毬", "2000"
+            )
+        )
+        second = _results(
+            plugin.command_monitor(
+                FakeEvent("aiocqhttp:group:second"), "藤田ことね", "2500"
+            )
+        )
+        await asyncio.gather(first, second)
+        running = [monitor for monitor in RecordingMonitor.instances if monitor.running]
+        assert running == [plugin.monitor]
+        await plugin.terminate()
+        assert not any(monitor.running for monitor in RecordingMonitor.instances)
+
+    asyncio.run(exercise())
+
+
 def test_provider_absence_selects_deterministic_fallbacks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -368,6 +461,51 @@ def test_provider_absence_selects_deterministic_fallbacks(
     assert isinstance(plugin.embeddings, DeterministicEmbeddings)
     assert isinstance(plugin.evaluator, DeterministicEvaluator)
     asyncio.run(plugin.terminate())
+
+
+def test_blank_target_test_uses_event_session_chat_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    payload = AgentDecision(
+        score=91,
+        recommendation="HIGH_PRIORITY",
+        reasons=("session provider",),
+        risks=(),
+        retrieved_evidence=(),
+        model_name="untrusted-output",
+        prompt_version="untrusted-output",
+    ).model_dump(mode="json")
+    provider = FakeChatProvider(json.dumps(payload))
+
+    class SessionContext(FakeContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.provider_requests: list[str | None] = []
+
+        def get_using_provider(self, umo: str | None = None) -> object | None:
+            self.provider_requests.append(umo)
+            if umo == "aiocqhttp:group:event-provider":
+                return provider
+            return None
+
+    context = SessionContext()
+    plugin = MercariAgentPlugin(context, {"target_session": ""})
+    event = FakeEvent("aiocqhttp:group:event-provider")
+
+    async def exercise() -> list[str]:
+        await plugin.initialize()
+        try:
+            assert isinstance(plugin.evaluator, DeterministicEvaluator)
+            return await _results(plugin.command_test(event))
+        finally:
+            await plugin.terminate()
+
+    result = asyncio.run(exercise())
+
+    assert "SUCCEEDED" in result[0]
+    assert context.provider_requests == [None, event.unified_msg_origin]
+    assert len(provider.prompts) == 1
 
 
 def test_offline_fallback_test_command_runs_end_to_end(
@@ -440,6 +578,45 @@ class FakeRepository:
 
 class FakeNotifier:
     successful_sends = 1
+
+
+def test_concurrent_test_commands_are_serialized() -> None:
+    class ConcurrentCrawlService(FakeCrawlService):
+        def __init__(self, notifier) -> None:
+            super().__init__(notifier)
+            self.active = 0
+            self.max_active = 0
+            self.next_job_id = 0
+
+        async def run_once(self, rule) -> int:
+            self.rules.append(rule)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0)
+            self.active -= 1
+            self.next_job_id += 1
+            return self.next_job_id
+
+    plugin = MercariAgentPlugin(
+        FakeContext(), {"target_session": "aiocqhttp:group:configured"}
+    )
+    plugin.watch_rule = plugin._build_watch_rule(
+        "aiocqhttp:group:configured"
+    )
+    plugin.notifier = FakeNotifier()
+    service = ConcurrentCrawlService(plugin.notifier)
+    plugin.crawl_service = service
+    plugin.repository = FakeRepository()
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            _results(plugin.command_test(FakeEvent("event:one"))),
+            _results(plugin.command_test(FakeEvent("event:two"))),
+        )
+
+    asyncio.run(exercise())
+
+    assert service.max_active == 1
 
 
 def test_test_command_falls_back_to_event_unified_msg_origin() -> None:

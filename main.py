@@ -49,6 +49,7 @@ class MercariAgentPlugin(Star):
         self.crawl_service: CrawlService | None = None
         self.monitor: Monitor | None = None
         self.watch_rule: WatchRule | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._enabled = bool(self._get("enabled", False))
         self._use_mock_collector = bool(self._get("use_mock_collector", True))
         self._poll_interval = max(
@@ -60,52 +61,67 @@ class MercariAgentPlugin(Star):
         self._target_session = str(self._get("target_session", "") or "").strip()
 
     async def initialize(self) -> None:
+        async with self._lifecycle_lock:
+            await self._initialize_unlocked()
+
+    async def _initialize_unlocked(self) -> None:
+        if self.repository is not None:
+            return
+
         data_dir = Path(StarTools.get_data_dir(_PLUGIN_NAME))
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
         repository = Repository.open(data_dir / "mercari_agent.db")
         self.repository = repository
 
-        self.embeddings = self._select_embeddings()
-        self.evaluator = self._select_evaluator()
-        self.notifier = AstrBotNotifier(self.context)
-        knowledge_dir = Path(__file__).resolve().parent / "knowledge"
-        self.retriever = await asyncio.to_thread(
-            MarkdownChromaRetriever.build,
-            knowledge_dir,
-            data_dir / "chroma",
-            self.embeddings,
-        )
-        self.graph = build_listing_graph(
-            repository,
-            self.retriever,
-            self.evaluator,
-            self.notifier,
-        )
-        self.crawl_service = CrawlService(
-            repository,
-            MockCollector(),
-            self.graph,
-            max_attempts=self._max_attempts,
-        )
-        self.watch_rule = self._build_watch_rule(self._target_session)
-
-        if not self._use_mock_collector:
-            logger.warning(
-                "Mercari Agent skeleton only supports MockCollector; "
-                "monitoring remains stopped."
+        try:
+            self.embeddings = self._select_embeddings()
+            self.evaluator = self._select_evaluator(
+                self._target_session or None
             )
-            return
+            self.notifier = AstrBotNotifier(self.context)
+            knowledge_dir = Path(__file__).resolve().parent / "knowledge"
+            self.retriever = await asyncio.to_thread(
+                MarkdownChromaRetriever.build,
+                knowledge_dir,
+                data_dir / "chroma",
+                self.embeddings,
+            )
+            self.graph, self.crawl_service = self._build_pipeline(
+                self.evaluator
+            )
+            self.watch_rule = self._build_watch_rule(self._target_session)
 
-        self.monitor = self._new_monitor()
-        if self._enabled and self.watch_rule.target_session:
-            await self.monitor.start()
+            if not self._use_mock_collector:
+                logger.warning(
+                    "Mercari Agent skeleton only supports MockCollector; "
+                    "monitoring remains stopped."
+                )
+                return
+
+            self.monitor = self._new_monitor()
+            if self._enabled and self.watch_rule.target_session:
+                await self.monitor.start()
+        except BaseException:
+            await self._terminate_unlocked()
+            raise
 
     async def terminate(self) -> None:
+        async with self._lifecycle_lock:
+            await self._terminate_unlocked()
+
+    async def _terminate_unlocked(self) -> None:
         monitor = self.monitor
         repository = self.repository
         self.monitor = None
         self.repository = None
+        self.embeddings = None
+        self.evaluator = None
+        self.notifier = None
+        self.retriever = None
+        self.graph = None
+        self.crawl_service = None
+        self.watch_rule = None
         try:
             if monitor is not None:
                 await monitor.stop()
@@ -154,13 +170,17 @@ class MercariAgentPlugin(Star):
 
     @filter.command("煤炉测试")
     async def command_test(self, event: AstrMessageEvent):
+        async with self._lifecycle_lock:
+            text = await self._command_test_unlocked(event)
+        yield event.plain_result(text)
+
+    async def _command_test_unlocked(self, event: AstrMessageEvent) -> str:
         if (
             self.crawl_service is None
             or self.repository is None
             or self.watch_rule is None
         ):
-            yield event.plain_result("煤炉 Agent 尚未初始化")
-            return
+            return "煤炉 Agent 尚未初始化"
 
         target = self._target_session or event.unified_msg_origin
         test_rule = self.watch_rule.model_copy(
@@ -169,13 +189,16 @@ class MercariAgentPlugin(Star):
                 "target_session": target,
             }
         )
-        job_id = await self.crawl_service.run_once(test_rule)
+        crawl_service = self.crawl_service
+        if not self._target_session:
+            session_evaluator = self._select_evaluator(target)
+            if isinstance(session_evaluator, AstrBotEvaluator):
+                _, crawl_service = self._build_pipeline(session_evaluator)
+        job_id = await crawl_service.run_once(test_rule)
         job = self.repository.get_job(job_id)
         sent = self.repository.count_sent_notifications(test_rule.id) > 0
         sent_text = "已发送" if sent else "未发送"
-        yield event.plain_result(
-            f"测试 Job #{job_id}：{job.state.value}；通知：{sent_text}"
-        )
+        return f"测试 Job #{job_id}：{job.state.value}；通知：{sent_text}"
 
     @filter.command("煤炉监控")
     async def command_monitor(
@@ -193,12 +216,22 @@ class MercariAgentPlugin(Star):
         if not keyword or parsed_price < 0:
             yield event.plain_result(_USAGE)
             return
+        async with self._lifecycle_lock:
+            text = await self._command_monitor_unlocked(
+                event, keyword, parsed_price
+            )
+        yield event.plain_result(text)
+
+    async def _command_monitor_unlocked(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        parsed_price: int,
+    ) -> str:
         if self.crawl_service is None:
-            yield event.plain_result("煤炉 Agent 尚未初始化")
-            return
+            return "煤炉 Agent 尚未初始化"
         if not self._use_mock_collector:
-            yield event.plain_result("当前仅支持 MockCollector，监控未启动")
-            return
+            return "当前仅支持 MockCollector，监控未启动"
 
         target = self._target_session or event.unified_msg_origin
         old_rule = self.watch_rule
@@ -221,23 +254,30 @@ class MercariAgentPlugin(Star):
         self.monitor = self._new_monitor()
         await self.monitor.start()
         self._enabled = True
-        yield event.plain_result(
-            f"煤炉监控已启动：{keyword}，最高 {parsed_price} JPY"
-        )
+        return f"煤炉监控已启动：{keyword}，最高 {parsed_price} JPY"
 
     @filter.command("煤炉暂停")
     async def command_pause(self, event: AstrMessageEvent):
+        async with self._lifecycle_lock:
+            text = await self._command_pause_unlocked()
+        yield event.plain_result(text)
+
+    async def _command_pause_unlocked(self) -> str:
         if self.monitor is not None:
             await self.monitor.stop()
         self._enabled = False
-        yield event.plain_result("煤炉监控已暂停")
+        return "煤炉监控已暂停"
 
     @filter.command("煤炉恢复")
     async def command_resume(self, event: AstrMessageEvent):
+        async with self._lifecycle_lock:
+            text = await self._command_resume_unlocked()
+        yield event.plain_result(text)
+
+    async def _command_resume_unlocked(self) -> str:
         rule = self.watch_rule
         if not self._use_mock_collector:
-            yield event.plain_result("当前仅支持 MockCollector，无法恢复")
-            return
+            return "当前仅支持 MockCollector，无法恢复"
         if (
             self.crawl_service is None
             or rule is None
@@ -245,13 +285,32 @@ class MercariAgentPlugin(Star):
             or rule.max_price_jpy is None
             or not rule.target_session.strip()
         ):
-            yield event.plain_result("请先使用 /煤炉监控 <关键词> <最高价> 设置有效规则")
-            return
+            return "请先使用 /煤炉监控 <关键词> <最高价> 设置有效规则"
         if self.monitor is None:
             self.monitor = self._new_monitor()
         await self.monitor.start()
         self._enabled = True
-        yield event.plain_result("煤炉监控已恢复")
+        return "煤炉监控已恢复"
+
+    def _build_pipeline(
+        self,
+        evaluator: AstrBotEvaluator | DeterministicEvaluator,
+    ) -> tuple[Any, CrawlService]:
+        assert self.repository is not None
+        assert self.retriever is not None
+        assert self.notifier is not None
+        graph = build_listing_graph(
+            self.repository,
+            self.retriever,
+            evaluator,
+            self.notifier,
+        )
+        return graph, CrawlService(
+            self.repository,
+            MockCollector(),
+            graph,
+            max_attempts=self._max_attempts,
+        )
 
     def _new_monitor(self) -> Monitor:
         assert self.crawl_service is not None
@@ -280,11 +339,11 @@ class MercariAgentPlugin(Star):
             enabled=True,
         )
 
-    def _select_evaluator(self) -> AstrBotEvaluator | DeterministicEvaluator:
+    def _select_evaluator(
+        self, target_session: str | None
+    ) -> AstrBotEvaluator | DeterministicEvaluator:
         try:
-            provider = self.context.get_using_provider(
-                self._target_session or None
-            )
+            provider = self.context.get_using_provider(target_session)
         except Exception:
             provider = None
         return (

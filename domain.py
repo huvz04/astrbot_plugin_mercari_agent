@@ -161,6 +161,8 @@ class Listing(DomainValue):
 
 
 class AgentDecision(DomainValue):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
     score: int = Field(ge=0, le=100)
     recommendation: Literal["SKIP", "REVIEW", "HIGH_PRIORITY"]
     reasons: tuple[str, ...] = ()
