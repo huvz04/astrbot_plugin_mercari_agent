@@ -15,9 +15,11 @@ from sqlalchemy.types import TypeDecorator
 from .domain import (
     ATTEMPT_TRANSITIONS,
     JOB_TRANSITIONS,
+    LISTING_RUN_TRANSITIONS,
     CrawlAttemptState,
     CrawlJobState,
     Listing,
+    ListingRunState,
     assert_transition,
 )
 
@@ -148,6 +150,7 @@ class ListingProcessRunRow(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
@@ -163,7 +166,10 @@ class NotificationRow(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
     decision_version: Mapped[str] = mapped_column(String, nullable=False)
+    target_session: Mapped[str] = mapped_column(String, nullable=False)
+    message_text: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
 
 @dataclass(frozen=True)
@@ -186,6 +192,15 @@ class CrawlAttempt:
     item_count: int | None
     started_at: datetime | None
     finished_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ListingProcessRun:
+    id: int
+    listing_id: int
+    watch_rule_id: str
+    state: ListingRunState
+    error_summary: str | None
 
 
 @dataclass(frozen=True)
@@ -324,6 +339,131 @@ class Repository:
                 if existing is None:
                     raise
                 return existing.id, False
+
+    def create_listing_run(self, listing_id: int, watch_rule_id: str) -> int:
+        with self._sessions.begin() as session:
+            if session.get(ListingRow, listing_id) is None:
+                raise KeyError(f"listing {listing_id} does not exist")
+            row = ListingProcessRunRow(
+                listing_id=listing_id,
+                watch_rule_id=watch_rule_id,
+                state=ListingRunState.DISCOVERED.value,
+                created_at=_utc_now(),
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def advance_listing_run(
+        self,
+        run_id: int,
+        target: ListingRunState,
+        error_summary: object = None,
+    ) -> None:
+        sanitized_error = _sanitize_error_summary(error_summary)
+        with self._sessions.begin() as session:
+            row = session.get(ListingProcessRunRow, run_id)
+            if row is None:
+                raise KeyError(f"listing process run {run_id} does not exist")
+            current = ListingRunState(row.state)
+            assert_transition(current, target, LISTING_RUN_TRANSITIONS)
+            updated = session.execute(
+                update(ListingProcessRunRow)
+                .where(
+                    ListingProcessRunRow.id == run_id,
+                    ListingProcessRunRow.state == current.value,
+                )
+                .values(
+                    state=target.value,
+                    error_summary=sanitized_error,
+                )
+            )
+            if updated.rowcount != 1:
+                raise ConcurrentStateChange(
+                    f"listing process run {run_id} changed concurrently"
+                )
+
+    def get_listing_run(self, run_id: int) -> ListingProcessRun:
+        with self._sessions() as session:
+            row = session.get(ListingProcessRunRow, run_id)
+            if row is None:
+                raise KeyError(f"listing process run {run_id} does not exist")
+            return ListingProcessRun(
+                id=row.id,
+                listing_id=row.listing_id,
+                watch_rule_id=row.watch_rule_id,
+                state=ListingRunState(row.state),
+                error_summary=row.error_summary,
+            )
+
+    def queue_notification(
+        self,
+        listing_id: int,
+        watch_rule_id: str,
+        decision_version: str,
+        target_session: str,
+        message_text: str,
+    ) -> tuple[int, bool]:
+        key_filter = (
+            NotificationRow.listing_id == listing_id,
+            NotificationRow.watch_rule_id == watch_rule_id,
+            NotificationRow.decision_version == decision_version,
+        )
+        try:
+            with self._sessions.begin() as session:
+                existing = session.scalar(
+                    select(NotificationRow).where(*key_filter)
+                )
+                if existing is not None:
+                    return existing.id, False
+                row = NotificationRow(
+                    listing_id=listing_id,
+                    watch_rule_id=watch_rule_id,
+                    decision_version=decision_version,
+                    target_session=target_session,
+                    message_text=message_text,
+                    created_at=_utc_now(),
+                )
+                session.add(row)
+                session.flush()
+                return row.id, True
+        except IntegrityError:
+            with self._sessions() as session:
+                existing = session.scalar(
+                    select(NotificationRow).where(*key_filter)
+                )
+                if existing is None:
+                    raise
+                return existing.id, False
+
+    def mark_notification_sent(self, notification_id: int) -> None:
+        with self._sessions.begin() as session:
+            row = session.get(NotificationRow, notification_id)
+            if row is None:
+                raise KeyError(f"notification {notification_id} does not exist")
+            if row.sent_at is not None:
+                return
+            updated = session.execute(
+                update(NotificationRow)
+                .where(
+                    NotificationRow.id == notification_id,
+                    NotificationRow.sent_at.is_(None),
+                )
+                .values(sent_at=_utc_now())
+            )
+            if updated.rowcount != 1:
+                raise ConcurrentStateChange(
+                    f"notification {notification_id} changed concurrently"
+                )
+
+    def count_notifications(self) -> int:
+        with self._sessions() as session:
+            return (
+                session.scalar(
+                    select(func.count()).select_from(NotificationRow)
+                )
+                or 0
+            )
 
     def get_attempt(self, attempt_id: int) -> CrawlAttempt:
         with self._sessions() as session:
