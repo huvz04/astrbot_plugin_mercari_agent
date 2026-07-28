@@ -145,6 +145,13 @@ class ListingRow(Base):
 
 class ListingProcessRunRow(Base):
     __tablename__ = "listing_process_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "listing_id",
+            "watch_rule_id",
+            name="uq_listing_run_rule",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
@@ -341,18 +348,47 @@ class Repository:
                 return existing.id, False
 
     def create_listing_run(self, listing_id: int, watch_rule_id: str) -> int:
-        with self._sessions.begin() as session:
-            if session.get(ListingRow, listing_id) is None:
-                raise KeyError(f"listing {listing_id} does not exist")
-            row = ListingProcessRunRow(
-                listing_id=listing_id,
-                watch_rule_id=watch_rule_id,
-                state=ListingRunState.DISCOVERED.value,
-                created_at=_utc_now(),
-            )
-            session.add(row)
-            session.flush()
-            return row.id
+        run_id, _ = self.get_or_create_listing_run(
+            listing_id,
+            watch_rule_id,
+        )
+        return run_id
+
+    def get_or_create_listing_run(
+        self,
+        listing_id: int,
+        watch_rule_id: str,
+    ) -> tuple[int, bool]:
+        key_filter = (
+            ListingProcessRunRow.listing_id == listing_id,
+            ListingProcessRunRow.watch_rule_id == watch_rule_id,
+        )
+        try:
+            with self._sessions.begin() as session:
+                if session.get(ListingRow, listing_id) is None:
+                    raise KeyError(f"listing {listing_id} does not exist")
+                existing = session.scalar(
+                    select(ListingProcessRunRow).where(*key_filter)
+                )
+                if existing is not None:
+                    return existing.id, False
+                row = ListingProcessRunRow(
+                    listing_id=listing_id,
+                    watch_rule_id=watch_rule_id,
+                    state=ListingRunState.DISCOVERED.value,
+                    created_at=_utc_now(),
+                )
+                session.add(row)
+                session.flush()
+                return row.id, True
+        except IntegrityError:
+            with self._sessions() as session:
+                existing = session.scalar(
+                    select(ListingProcessRunRow).where(*key_filter)
+                )
+                if existing is None:
+                    raise
+                return existing.id, False
 
     def advance_listing_run(
         self,

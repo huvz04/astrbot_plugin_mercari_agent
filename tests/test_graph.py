@@ -267,6 +267,74 @@ def test_invoking_graph_twice_creates_one_run_notification_and_send(
 
     assert first["listing_created"] is True
     assert second["listing_created"] is False
+    assert first["process_run_created"] is True
+    assert second["process_run_created"] is False
+    assert repository.count_notifications() == 1
+    assert _run_count(repository) == 1
+    assert len(notifier.calls) == 1
+
+
+def test_same_listing_under_different_rules_creates_distinct_runs_and_notifications(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    retriever = RecordingRetriever()
+    evaluator = FixedEvaluator()
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(repository, retriever, evaluator, notifier)
+    second_rule = rule.model_copy(
+        update={
+            "id": "rule-2",
+            "target_session": "aiocqhttp:group:456",
+        }
+    )
+
+    first = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": rule})
+    )
+    second = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": second_rule})
+    )
+
+    assert first["process_run_id"] != second["process_run_id"]
+    assert first["process_run_created"] is True
+    assert second["process_run_created"] is True
+    assert repository.count_notifications() == 2
+    assert _run_count(repository) == 2
+    assert len(notifier.calls) == 2
+    assert [target for target, _ in notifier.calls] == [
+        rule.target_session,
+        second_rule.target_session,
+    ]
+
+
+def test_pre_saved_listing_without_a_run_is_still_processed(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    listing_id, listing_created = repository.save_listing(listing)
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(
+        repository,
+        RecordingRetriever(),
+        FixedEvaluator(),
+        notifier,
+    )
+
+    result = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": rule})
+    )
+
+    assert listing_created is True
+    assert result["listing_id"] == listing_id
+    assert result["listing_created"] is False
+    assert result["process_run_created"] is True
+    assert (
+        repository.get_listing_run(result["process_run_id"]).state
+        is ListingRunState.NOTIFIED
+    )
     assert repository.count_notifications() == 1
     assert _run_count(repository) == 1
     assert len(notifier.calls) == 1

@@ -33,6 +33,7 @@ class ListingGraphState(TypedDict, total=False):
     listing_id: int
     listing_created: bool
     process_run_id: int
+    process_run_created: bool
     filter_result: FilterResult
     retrieved_documents: list[Evidence]
     agent_decision: AgentDecision
@@ -88,15 +89,21 @@ def build_listing_graph(
             "listing_id": listing_id,
             "listing_created": listing_created,
         }
-        if not listing_created:
-            return result
-        run_id = repository.create_listing_run(
+        run_id, run_created = repository.get_or_create_listing_run(
             listing_id,
             state["watch_rule"].id,
         )
-        repository.advance_listing_run(run_id, ListingRunState.NORMALIZED)
-        repository.advance_listing_run(run_id, ListingRunState.DEDUP_CHECKED)
         result["process_run_id"] = run_id
+        result["process_run_created"] = run_created
+        if run_created:
+            repository.advance_listing_run(
+                run_id,
+                ListingRunState.NORMALIZED,
+            )
+            repository.advance_listing_run(
+                run_id,
+                ListingRunState.DEDUP_CHECKED,
+            )
         return result
 
     def hard_filter_node(state: ListingGraphState) -> ListingGraphState:
@@ -198,7 +205,9 @@ def build_listing_graph(
     builder.add_edge("normalize", "deduplicate")
     builder.add_conditional_edges(
         "deduplicate",
-        lambda state: "new" if state["listing_created"] else "duplicate",
+        lambda state: (
+            "new" if state["process_run_created"] else "duplicate"
+        ),
         {"new": "hard_filter", "duplicate": END},
     )
     builder.add_conditional_edges(
