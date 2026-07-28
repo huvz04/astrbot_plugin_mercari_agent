@@ -109,6 +109,7 @@ class SuccessfulNotifier:
 class FailingPollService:
     def __init__(self) -> None:
         self.started = asyncio.Event()
+        self.continued = asyncio.Event()
 
     def active_rule_ids(self) -> tuple[str, ...]:
         return ("rule-1",)
@@ -120,9 +121,10 @@ class FailingPollService:
         rule_id: str | None = None,
     ) -> None:
         self.started.set()
-        raise RuntimeError("poller failed")
+        raise RuntimeError("Authorization: private-token")
 
     async def run_scheduled(self, rule: WatchRule) -> int:
+        self.continued.set()
         return 0
 
 
@@ -486,22 +488,29 @@ def test_monitor_lifecycle_is_idempotent_and_leaves_no_running_task(
     assert monitor.task is None
 
 
-def test_monitor_stop_clears_task_when_the_poller_already_failed(
+def test_monitor_records_startup_recovery_error_and_continues_polling(
     rule: WatchRule,
 ) -> None:
     service = FailingPollService()
-    monitor = Monitor(service, [rule], poll_interval=60)  # type: ignore[arg-type]
+    monitor = Monitor(
+        service,
+        [rule],
+        poll_interval=60,
+        error_delay=0.001,
+    )  # type: ignore[arg-type]
 
     async def exercise() -> None:
         await monitor.start()
-        await service.started.wait()
-        with pytest.raises(RuntimeError, match="poller failed"):
-            await monitor.stop()
+        await asyncio.wait_for(service.started.wait(), timeout=1)
+        await asyncio.wait_for(service.continued.wait(), timeout=1)
+        assert monitor.running is True
+        await monitor.stop()
 
     asyncio.run(exercise())
 
     assert monitor.running is False
     assert monitor.task is None
+    assert monitor.last_poll_error == "sensitive error detail redacted"
 
 
 def test_cancelling_a_crawl_terminalizes_attempt_and_recovery_retries_it(
@@ -699,3 +708,114 @@ def test_poll_cycle_preserves_future_backoff_without_creating_another_job(
     assert job_count == 1
     assert attempt_count == 1
     assert repository.get_job(job_id).state is CrawlJobState.ACTIVE
+
+
+def test_one_rule_failure_does_not_block_later_rule_or_next_cycle() -> None:
+    first = WatchRule(
+        id="first",
+        name="first",
+        interval_seconds=1,
+        target_session="session:first",
+    )
+    second = first.model_copy(
+        update={"id": "second", "name": "second", "target_session": "session:second"}
+    )
+
+    class PerRuleFailureService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.second_ran = asyncio.Event()
+            self.first_recovered = asyncio.Event()
+
+        def active_rule_ids(self) -> tuple[str, ...]:
+            return ()
+
+        async def resume_active_jobs(
+            self,
+            rules_by_id: dict[str, WatchRule],
+            *,
+            rule_id: str | None = None,
+        ) -> None:
+            return None
+
+        async def run_scheduled(self, rule: WatchRule) -> int:
+            self.calls.append(rule.id)
+            if rule.id == "first" and self.calls.count("first") == 1:
+                raise RuntimeError("Cookie: private-value")
+            if rule.id == "second":
+                self.second_ran.set()
+            if rule.id == "first":
+                self.first_recovered.set()
+            return len(self.calls)
+
+    service = PerRuleFailureService()
+    monitor = Monitor(
+        service,
+        [first, second],
+        poll_interval=0.01,
+        error_delay=0.001,
+    )  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        await monitor.start()
+        await asyncio.wait_for(service.second_ran.wait(), timeout=1)
+        await asyncio.wait_for(service.first_recovered.wait(), timeout=1)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+    assert service.calls[:3] == ["first", "second", "first"]
+    assert monitor.last_poll_error == "sensitive error detail redacted"
+
+
+def test_one_startup_recovery_failure_does_not_block_another_rule() -> None:
+    first = WatchRule(
+        id="first",
+        name="first",
+        interval_seconds=1,
+        target_session="session:first",
+    )
+    second = first.model_copy(
+        update={"id": "second", "name": "second", "target_session": "session:second"}
+    )
+
+    class PerRuleRecoveryFailureService:
+        def __init__(self) -> None:
+            self.recovery_calls: list[str] = []
+            self.second_recovered = asyncio.Event()
+
+        def active_rule_ids(self) -> tuple[str, ...]:
+            return ("first", "second")
+
+        async def resume_active_jobs(
+            self,
+            rules_by_id: dict[str, WatchRule],
+            *,
+            rule_id: str | None = None,
+        ) -> None:
+            assert rule_id is not None
+            self.recovery_calls.append(rule_id)
+            if rule_id == "first":
+                raise RuntimeError("Authorization: private-token")
+            self.second_recovered.set()
+
+        async def run_scheduled(self, rule: WatchRule) -> int:
+            return 0
+
+    service = PerRuleRecoveryFailureService()
+    monitor = Monitor(
+        service,
+        [first, second],
+        poll_interval=60,
+        error_delay=0.001,
+    )  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        await monitor.start()
+        await asyncio.wait_for(service.second_recovered.wait(), timeout=1)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+    assert service.recovery_calls == ["first", "second"]
+    assert monitor.last_poll_error == "sensitive error detail redacted"

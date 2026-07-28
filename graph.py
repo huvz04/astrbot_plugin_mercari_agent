@@ -260,6 +260,11 @@ def build_listing_graph(
             state["listing"],
             state["retrieved_documents"],
         )
+        available_evidence = {
+            item.document_id for item in state["retrieved_documents"]
+        }
+        if not set(decision.retrieved_evidence) <= available_evidence:
+            raise ValueError("agent cited unavailable evidence")
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.AGENT_EVALUATED,

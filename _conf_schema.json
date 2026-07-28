@@ -17,6 +17,12 @@
     "default": 3,
     "hint": "代码会限制在 1 到 5 次。"
   },
+  "recovery_stale_after_seconds": {
+    "description": "崩溃恢复陈旧阈值（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "低于 30 秒会按 30 秒处理；应长于一次正常采集调用。"
+  },
   "target_session": {
     "description": "主动通知目标会话",
     "type": "string",
@@ -56,6 +62,12 @@
     "description": "Embedding Provider ID",
     "type": "string",
     "default": "",
-    "hint": "留空时优先使用第一个 AstrBot Embedding Provider；没有 Provider 时使用确定性本地回退。"
+    "hint": "仅在 allow_external_providers=true 时生效；留空时选择第一个可用 Provider。"
+  },
+  "allow_external_providers": {
+    "description": "允许向外部 Chat/Embedding Provider 发送内容",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时始终使用确定性本地适配器；开启前请确认商品与知识片段的数据外发范围。"
   }
 }

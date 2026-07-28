@@ -472,6 +472,51 @@ def test_provider_absence_selects_deterministic_fallbacks(
     asyncio.run(plugin.terminate())
 
 
+def test_external_providers_are_opt_in_even_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    chat_provider = FakeChatProvider("{}")
+    embedding_provider = FakeEmbeddingProvider()
+
+    class ProviderRecordingContext(FakeContext):
+        def __init__(self) -> None:
+            super().__init__(
+                chat_provider=chat_provider,
+                embedding_providers=[embedding_provider],
+            )
+            self.chat_requests = 0
+            self.embedding_requests = 0
+
+        def get_using_provider(self, umo: str | None = None) -> object | None:
+            self.chat_requests += 1
+            return super().get_using_provider(umo)
+
+        def get_all_embedding_providers(self) -> list[object]:
+            self.embedding_requests += 1
+            return super().get_all_embedding_providers()
+
+    context = ProviderRecordingContext()
+    plugin = MercariAgentPlugin(context, {})
+
+    asyncio.run(plugin.initialize())
+
+    assert isinstance(plugin.embeddings, DeterministicEmbeddings)
+    assert isinstance(plugin.evaluator, DeterministicEvaluator)
+    assert context.chat_requests == 0
+    assert context.embedding_requests == 0
+    asyncio.run(plugin.terminate())
+
+
+def test_external_provider_config_defaults_to_disabled() -> None:
+    schema_path = Path(__file__).parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert schema["allow_external_providers"]["type"] == "bool"
+    assert schema["allow_external_providers"]["default"] is False
+
+
 def test_initialize_recovers_persisted_notification_outbox_before_monitor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -522,7 +567,13 @@ def test_blank_target_test_uses_event_session_chat_provider(
             return None
 
     context = SessionContext()
-    plugin = MercariAgentPlugin(context, {"target_session": ""})
+    plugin = MercariAgentPlugin(
+        context,
+        {
+            "target_session": "",
+            "allow_external_providers": True,
+        },
+    )
     event = FakeEvent("aiocqhttp:group:event-provider")
 
     async def exercise() -> list[str]:
@@ -570,7 +621,10 @@ def test_configured_embedding_provider_is_selected_by_id(
     selected = FakeEmbeddingProvider("selected")
     plugin = MercariAgentPlugin(
         FakeContext(embedding_providers=[first, selected]),
-        {"embedding_provider_id": "selected"},
+        {
+            "embedding_provider_id": "selected",
+            "allow_external_providers": True,
+        },
     )
 
     asyncio.run(plugin.initialize())
@@ -680,6 +734,26 @@ def test_invalid_monitor_price_yields_usage_text(price: str) -> None:
     )
 
     assert result == ["用法：/煤炉监控 <关键词> <最高价>（最高价为非负整数 JPY）"]
+
+
+def test_status_exposes_the_last_sanitized_poll_error() -> None:
+    class StatusRepository:
+        def latest_job(self) -> None:
+            return None
+
+    plugin = MercariAgentPlugin(FakeContext(), {})
+    plugin.repository = StatusRepository()
+    plugin.watch_rule = plugin._build_watch_rule("session")
+    plugin.monitor = SimpleNamespace(
+        running=True,
+        last_poll_error="sensitive error detail redacted",
+    )
+
+    result = asyncio.run(
+        _results(plugin.command_status(FakeEvent("session")))
+    )
+
+    assert "轮询错误：sensitive error detail redacted" in result[0]
 
 
 def test_terminate_twice_stops_monitor_and_disposes_repository() -> None:

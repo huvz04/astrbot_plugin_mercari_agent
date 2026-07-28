@@ -101,6 +101,11 @@ def _sanitize_error_summary(value: object) -> str | None:
     return compact or None
 
 
+def sanitize_error_summary(value: object) -> str | None:
+    """Public boundary for retaining safe operational diagnostics."""
+    return _sanitize_error_summary(value)
+
+
 def _sanitize_error_type(value: object) -> str | None:
     if value is None:
         return None

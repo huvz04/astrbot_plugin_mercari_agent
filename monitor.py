@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .domain import CrawlAttemptState, CrawlJobState, Listing, WatchRule
-from .storage import CrawlAttempt, Repository
+from .storage import CrawlAttempt, Repository, sanitize_error_summary
 
 
 class Collector(Protocol):
@@ -314,15 +314,20 @@ class Monitor:
         rules: Iterable[WatchRule],
         *,
         poll_interval: float,
+        error_delay: float = 1.0,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
+        if error_delay <= 0:
+            raise ValueError("error_delay must be positive")
         self._crawl_service = crawl_service
         self._rules = tuple(rules)
         self._poll_interval = poll_interval
+        self._error_delay = min(error_delay, poll_interval, 5.0)
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._rule_locks: dict[str, asyncio.Lock] = {}
+        self._last_poll_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -331,6 +336,10 @@ class Monitor:
     @property
     def task(self) -> asyncio.Task[None] | None:
         return self._task
+
+    @property
+    def last_poll_error(self) -> str | None:
+        return self._last_poll_error
 
     async def start(self) -> None:
         if self.running:
@@ -362,20 +371,52 @@ class Monitor:
 
     async def _poll(self) -> None:
         rules_by_id = {rule.id: rule for rule in self._rules}
-        for rule_id in self._crawl_service.active_rule_ids():
-            lock = self._rule_locks.setdefault(rule_id, asyncio.Lock())
-            async with lock:
-                await self._crawl_service.resume_active_jobs(
-                    rules_by_id,
-                    rule_id=rule_id,
-                )
+        startup_failed = False
+        try:
+            active_rule_ids = self._crawl_service.active_rule_ids()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            active_rule_ids = ()
+            startup_failed = True
+            self._record_poll_error(error)
+        for rule_id in active_rule_ids:
+            try:
+                lock = self._rule_locks.setdefault(rule_id, asyncio.Lock())
+                async with lock:
+                    await self._crawl_service.resume_active_jobs(
+                        rules_by_id,
+                        rule_id=rule_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                startup_failed = True
+                self._record_poll_error(error)
+        if startup_failed:
+            await self._wait(self._error_delay)
         while not self._stop_event.is_set():
+            cycle_failed = False
             for rule in self._rules:
                 if rule.enabled:
-                    await self.run_rule_now(rule)
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self._poll_interval
-                )
-            except TimeoutError:
-                continue
+                    try:
+                        await self.run_rule_now(rule)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        cycle_failed = True
+                        self._record_poll_error(error)
+            await self._wait(
+                self._error_delay if cycle_failed else self._poll_interval
+            )
+
+    def _record_poll_error(self, error: Exception) -> None:
+        self._last_poll_error = (
+            sanitize_error_summary(str(error)) or "poll error"
+        )
+
+    async def _wait(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            return

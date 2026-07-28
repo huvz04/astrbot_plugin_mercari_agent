@@ -40,6 +40,19 @@ class DeterministicEmbeddings:
         ]
 
 
+class FingerprintedEmbeddings:
+    def __init__(self, identity: str, dimension: int) -> None:
+        self.embedding_identity = identity
+        self.dimension = dimension
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_query(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        seed = float((sum(ord(character) for character in text) % 97) + 1)
+        return [seed + offset for offset in range(self.dimension)]
+
+
 class RecordingRetriever:
     def __init__(self) -> None:
         self.queries: list[str] = []
@@ -75,6 +88,16 @@ class FixedEvaluator:
             retrieved_evidence=tuple(item.document_id for item in evidence),
             model_name="offline-fixed-evaluator",
             prompt_version="decision-v1",
+        )
+
+
+class HallucinatingEvaluator(FixedEvaluator):
+    async def evaluate(
+        self, listing: Listing, evidence: list[Evidence]
+    ) -> AgentDecision:
+        decision = await super().evaluate(listing, evidence)
+        return decision.model_copy(
+            update={"retrieved_evidence": ("not-returned-by-retriever",)}
         )
 
 
@@ -232,6 +255,50 @@ def test_markdown_retriever_returns_stable_source_metadata(
     assert evidence
     assert evidence[0].document_id
     assert evidence[0].document_id in {"aliases", "risk_terms"}
+
+
+def test_markdown_retriever_reopens_without_duplicates_and_isolates_embeddings(
+    tmp_path: Path,
+) -> None:
+    knowledge_dir = Path(__file__).parents[1] / "knowledge"
+    persist_dir = tmp_path / "persistent-chroma"
+
+    first = MarkdownChromaRetriever.build(
+        knowledge_dir,
+        persist_dir,
+        FingerprintedEmbeddings("provider-a", 3),
+    )
+    first_name = first.vector_store._collection.name
+    first_ids = sorted(first.vector_store.get()["ids"])
+    first_count = first.vector_store._collection.count()
+
+    reopened = MarkdownChromaRetriever.build(
+        knowledge_dir,
+        persist_dir,
+        FingerprintedEmbeddings("provider-a", 3),
+    )
+    changed_identity = MarkdownChromaRetriever.build(
+        knowledge_dir,
+        persist_dir,
+        FingerprintedEmbeddings("provider-b", 3),
+    )
+    changed_dimension = MarkdownChromaRetriever.build(
+        knowledge_dir,
+        persist_dir,
+        FingerprintedEmbeddings("provider-a", 4),
+    )
+
+    assert reopened.vector_store._collection.name == first_name
+    assert reopened.vector_store._collection.count() == first_count
+    assert sorted(reopened.vector_store.get()["ids"]) == first_ids
+    assert len(first_ids) == len(set(first_ids))
+    assert all(len(chunk_id) == 64 for chunk_id in first_ids)
+    assert changed_identity.vector_store._collection.name != first_name
+    assert changed_dimension.vector_store._collection.name != first_name
+    assert (
+        changed_dimension.vector_store._collection.name
+        != changed_identity.vector_store._collection.name
+    )
 
 
 def test_knowledge_files_define_all_required_terms() -> None:
@@ -445,3 +512,28 @@ def test_process_run_error_summaries_are_sanitized(
         repository.get_listing_run(run_id).error_summary
         == "sensitive error detail redacted"
     )
+
+
+def test_hallucinated_evidence_id_fails_without_queueing_or_dispatch(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(
+        repository,
+        RecordingRetriever(),
+        HallucinatingEvaluator(),
+        notifier,
+    )
+
+    result = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": rule})
+    )
+
+    run = repository.get_listing_run(result["process_run_id"])
+    assert run.state is ListingRunState.FAILED
+    assert run.error_summary == "agent cited unavailable evidence"
+    assert repository.count_notifications() == 0
+    assert notifier.calls == []
+    assert result["errors"] == ["agent cited unavailable evidence"]

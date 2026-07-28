@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -52,11 +53,20 @@ class MercariAgentPlugin(Star):
         self._lifecycle_lock = asyncio.Lock()
         self._enabled = bool(self._get("enabled", False))
         self._use_mock_collector = bool(self._get("use_mock_collector", True))
+        self._allow_external_providers = bool(
+            self._get("allow_external_providers", False)
+        )
         self._poll_interval = max(
             10, self._int_config("poll_interval_seconds", 60)
         )
         self._max_attempts = min(
             5, max(1, self._int_config("max_attempts", 3))
+        )
+        self._recovery_stale_after = timedelta(
+            seconds=max(
+                30,
+                self._int_config("recovery_stale_after_seconds", 300),
+            )
         )
         self._target_session = str(self._get("target_session", "") or "").strip()
 
@@ -141,6 +151,11 @@ class MercariAgentPlugin(Star):
         job = repository.latest_job()
         attempts = repository.attempts(job.id) if job else []
         attempt = attempts[-1] if attempts else None
+        poll_error = (
+            getattr(self.monitor, "last_poll_error", None)
+            if self.monitor is not None
+            else None
+        )
         rule_text = (
             f"关键词={','.join(rule.include_keywords) or '-'}，"
             f"最高价={rule.max_price_jpy} JPY，目标={rule.target_session or '-'}"
@@ -165,6 +180,7 @@ class MercariAgentPlugin(Star):
                         if attempt and attempt.next_retry_at
                         else "下次重试：-"
                     ),
+                    f"轮询错误：{poll_error or '-'}",
                 )
             )
         )
@@ -315,6 +331,7 @@ class MercariAgentPlugin(Star):
             MockCollector(),
             graph,
             max_attempts=self._max_attempts,
+            attempt_stale_after=self._recovery_stale_after,
         )
 
     def _new_monitor(self) -> Monitor:
@@ -347,6 +364,8 @@ class MercariAgentPlugin(Star):
     def _select_evaluator(
         self, target_session: str | None
     ) -> AstrBotEvaluator | DeterministicEvaluator:
+        if not self._allow_external_providers:
+            return DeterministicEvaluator()
         try:
             provider = self.context.get_using_provider(target_session)
         except Exception:
@@ -360,6 +379,8 @@ class MercariAgentPlugin(Star):
     def _select_embeddings(
         self,
     ) -> AstrBotEmbeddings | DeterministicEmbeddings:
+        if not self._allow_external_providers:
+            return DeterministicEmbeddings()
         configured_id = str(
             self._get("embedding_provider_id", "") or ""
         ).strip()

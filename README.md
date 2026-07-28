@@ -21,8 +21,8 @@ AstrBot 定时调度 / 手动命令
 规则。RAG/Agent 只处理这些确定性步骤不适合承担的内容，例如商品别名、风险
 知识和可解释的评估理由；它不会替代价格/关键词等硬约束。
 
-离线验收能证明通知器被调用且本地通知记录被标记为已发送；它**不能**证明 QQ
-已经送达。QQ 的真实送达只能由实际 AstrBot 运行时及目标平台回执/可见消息证明。
+离线验收能证明通知已提交给匹配的 AstrBot 平台，且本地通知记录进入 `SENT`；
+它**不能**证明 QQ 已经送达。QQ 的真实送达只能由目标平台回执或可见消息证明。
 
 ## 三个单调状态机
 
@@ -32,8 +32,11 @@ AstrBot 定时调度 / 手动命令
   Job 创建一个新的 Attempt。
 - **每规则 ListingProcessRun**：`DISCOVERED -> NORMALIZED -> DEDUP_CHECKED ->
   RULE_EVALUATED -> RAG_RETRIEVED -> AGENT_EVALUATED -> NOTIFICATION_QUEUED ->
-  NOTIFIED`；硬过滤可终止为 `REJECTED`，异常可终止为 `FAILED`。同一 Listing 与
-  同一规则只会有一条处理记录，通知也按版本幂等。
+  NOTIFIED`；硬过滤可终止为 `REJECTED`，异常可终止为 `FAILED`。失败或陈旧的
+  非终态运行会以递增 `run_no` 创建新记录；`NOTIFIED`/`REJECTED` 才抑制重处理。
+- **Notification outbox**：`QUEUED -> SENDING -> SENT | FAILED_KNOWN |
+  VERIFY_REQUIRED`。明确失败可由新处理运行安全重排；发送结果不确定时进入
+  `VERIFY_REQUIRED`，不会自动重发。
 
 ## 安装与依赖
 
@@ -62,12 +65,14 @@ python -m pip install -r requirements.txt
 | `enabled` | 是否在初始化后启动后台监控 | `false` |
 | `poll_interval_seconds` | 轮询间隔（代码下限为 10 秒） | `60` |
 | `max_attempts` | 每个 Job 的最多尝试次数（代码限制 1–5） | `3` |
+| `recovery_stale_after_seconds` | 崩溃恢复陈旧阈值（代码下限 30 秒） | `300` |
 | `target_session` | AstrBot `unified_msg_origin` 主动通知目标 | 留空，先在当前会话测试 |
 | `include_keywords` | 必须命中的默认关键词 | `["月村手毬"]` |
 | `exclude_keywords` | 命中即跳过的关键词 | `["ジャンク", "欠品"]` |
 | `max_price_jpy` | 最高可接受价格（JPY） | `3000` |
 | `use_mock_collector` | 使用离线 MockCollector | `true`，当前唯一可运行模式 |
-| `embedding_provider_id` | 指定 AstrBot Embedding Provider ID | 留空，先用自动选择/本地回退 |
+| `allow_external_providers` | 是否允许内容发送到外部 Chat/Embedding Provider | `false` |
+| `embedding_provider_id` | 外部 Embedding Provider ID | 外部 Provider 关闭时留空 |
 
 ## 命令
 
@@ -79,14 +84,29 @@ python -m pip install -r requirements.txt
 
 ## Provider 与离线回退
 
-插件优先复用当前 AstrBot 会话的 Chat Provider 进行评估；Embedding 优先使用
-`embedding_provider_id` 对应的 AstrBot Provider，留空时选第一个可用 Embedding
-Provider。插件不新增、不保存 Provider 密钥。没有可用 Provider 时，会使用稳定
-的本地确定性 Embedding 和结构化评估回退，因而 `/煤炉测试` 与离线测试仍可重放。
+`allow_external_providers` 默认是 `false`；此时即使 AstrBot 已配置 Provider，
+插件也始终使用确定性本地 Embedding 和本地评估器。
+
+只有显式改为 `true` 后，插件才会复用 AstrBot Provider。届时：
+
+- 商品标题、描述以及检索到的知识片段会发送给所选 Chat Provider 进行评估；
+- 本地 Markdown 知识片段会发送给所选 Embedding Provider 建立向量索引；
+- 检索查询中的商品标题和描述也会发送给该 Embedding Provider。
+
+`embedding_provider_id` 指定 Embedding Provider；留空时选第一个可用项。插件不
+新增或保存 Provider 密钥。启用前应确认这些商品和知识内容允许外发，并查看所选
+Provider 的数据处理政策。
 
 ## 离线测试
 
-在已经安装 `requirements.txt` 的 Python 环境中运行：
+先安装运行时与开发依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+```
+
+然后运行：
 
 ```powershell
 python -m pytest astrbot_plugin_mercari_agent/tests -v -p no:cacheprovider
@@ -100,8 +120,8 @@ SQLite、Chroma、编译后的 LangGraph、重试状态转换、去重和通知�
 ## 本地数据、隐私与日志
 
 AstrBot 的插件数据目录中会创建 `mercari_agent.db`（任务、Attempt、Listing、
-处理记录和通知记录）以及 `chroma/`（由本地 Markdown 知识构建的 Chroma 持久化
-文件）。Listing 标题、描述、价格、URL 与通知文本会进入本地数据库；请按自己的
+处理记录和通知 outbox）以及 `chroma/`（按语料和 Embedding 指纹隔离的持久化
+集合）。Listing 标题、描述、价格、URL 与通知文本会进入本地数据库；请按自己的
 数据保留策略保护或清理该目录。错误摘要会做敏感字段脱敏，采集响应正文不会写入
 数据库。日志不应包含凭据、Cookie 或访问令牌；如需排障，也请先移除敏感数据。
 
