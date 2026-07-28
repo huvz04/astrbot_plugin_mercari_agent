@@ -618,7 +618,7 @@ def test_recover_stale_listing_work_excludes_outbox_owned_run(
         run_id,
         ListingRunState.AGENT_EVALUATED,
     )
-    repository.queue_notification_for_run(
+    notification_id, _ = repository.queue_notification_for_run(
         run_id,
         decision_version=rule.decision_version,
         target_session=rule.target_session,
@@ -641,6 +641,32 @@ def test_recover_stale_listing_work_excludes_outbox_owned_run(
         repository.get_listing_run(run_id).state
         is ListingRunState.NOTIFICATION_QUEUED
     )
+
+    claimed = repository.claim_notification(notification_id)
+    assert claimed is not None
+    assert (
+        repository.get_notification(notification_id).state
+        is NotificationState.SENDING
+    )
+    assert repository.recover_stale_listing_work(
+        stale_after=timedelta(seconds=30)
+    ) == []
+
+    repository.mark_notification_verify_required(
+        notification_id,
+        "uncertain platform result",
+    )
+    assert (
+        repository.get_notification(notification_id).state
+        is NotificationState.VERIFY_REQUIRED
+    )
+    assert (
+        repository.get_listing_run(run_id).state
+        is ListingRunState.FAILED
+    )
+    assert repository.recover_stale_listing_work(
+        stale_after=timedelta(seconds=30)
+    ) == []
     with repository._sessions() as session:
         assert session.query(ListingProcessRunRow).count() == 1
 
