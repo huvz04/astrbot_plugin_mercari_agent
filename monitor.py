@@ -57,6 +57,7 @@ class RetryPolicy:
             "http_5xx",
             "parse_error",
             "cancelled",
+            "crash_recovered",
         }
     )
 
@@ -112,9 +113,12 @@ class CrawlService:
         max_attempts: int = 3,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = lambda: 0.0,
+        attempt_stale_after: timedelta = timedelta(minutes=5),
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
+        if attempt_stale_after <= timedelta(0):
+            raise ValueError("attempt_stale_after must be positive")
         self._repository = repository
         self._collector = collector
         self._graph = graph
@@ -122,6 +126,7 @@ class CrawlService:
         self._max_attempts = max_attempts
         self._sleep = sleep
         self._jitter = jitter
+        self._attempt_stale_after = attempt_stale_after
 
     async def run_once(self, rule: WatchRule) -> int:
         """Create, activate, and run one durable job for *rule*."""
@@ -131,24 +136,43 @@ class CrawlService:
         return job_id
 
     async def resume_active_jobs(
-        self, rules_by_id: Mapping[str, WatchRule]
+        self,
+        rules_by_id: Mapping[str, WatchRule],
+        *,
+        rule_id: str | None = None,
     ) -> None:
         """Continue only due, retryable active work after a process restart."""
         now = datetime.now(timezone.utc)
-        for job in self._repository.active_jobs():
+        for job in self._repository.active_jobs(rule_id):
             rule = rules_by_id.get(job.rule_id)
             if rule is None:
                 self._repository.finish_job(job.id, CrawlJobState.CANCELLED)
                 continue
 
             attempts = self._repository.attempts(job.id)
-            if self._has_unfinished_attempt(attempts):
-                continue
             if not attempts:
                 await self._run_new_attempts(job.id, rule)
                 continue
 
             latest = attempts[-1]
+            if latest.state is CrawlAttemptState.SUCCEEDED:
+                self._repository.finish_job(job.id, CrawlJobState.SUCCEEDED)
+                continue
+            if latest.state not in {
+                CrawlAttemptState.SUCCEEDED,
+                CrawlAttemptState.FAILED,
+            }:
+                if latest.updated_at > now - self._attempt_stale_after:
+                    continue
+                self._repository.advance_attempt(
+                    latest.id,
+                    CrawlAttemptState.FAILED,
+                    error_type="crash_recovered",
+                    error_summary="stale attempt recovered after restart",
+                    next_retry_at=now,
+                    finished_at=now,
+                )
+                latest = self._repository.get_attempt(latest.id)
             if latest.state is not CrawlAttemptState.FAILED:
                 continue
             if latest.attempt_no >= self._max_attempts:
@@ -157,9 +181,20 @@ class CrawlService:
             if not self._retry_policy.is_retryable_error_type(latest.error_type):
                 self._repository.finish_job(job.id, CrawlJobState.EXHAUSTED)
                 continue
-            if latest.next_retry_at is None or latest.next_retry_at > now:
+            if latest.next_retry_at is not None and latest.next_retry_at > now:
                 continue
             await self._run_new_attempts(job.id, rule)
+
+    async def run_scheduled(self, rule: WatchRule) -> int:
+        """Recover a rule first and create work only when no ACTIVE Job remains."""
+        await self.resume_active_jobs({rule.id: rule}, rule_id=rule.id)
+        active = self._repository.active_job_for_rule(rule.id)
+        if active is not None:
+            return active.id
+        return await self.run_once(rule)
+
+    def active_rule_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(job.rule_id for job in self._repository.active_jobs()))
 
     async def _run_new_attempts(self, job_id: int, rule: WatchRule) -> None:
         """Drive fresh attempts until the job reaches a terminal state."""
@@ -319,7 +354,7 @@ class Monitor:
     async def run_rule_now(self, rule: WatchRule) -> int:
         lock = self._rule_locks.setdefault(rule.id, asyncio.Lock())
         async with lock:
-            return await self._crawl_service.run_once(rule)
+            return await self._crawl_service.run_scheduled(rule)
 
     def status_text(self) -> str:
         state = "running" if self.running else "stopped"
@@ -327,8 +362,14 @@ class Monitor:
 
     async def _poll(self) -> None:
         rules_by_id = {rule.id: rule for rule in self._rules}
+        for rule_id in self._crawl_service.active_rule_ids():
+            lock = self._rule_locks.setdefault(rule_id, asyncio.Lock())
+            async with lock:
+                await self._crawl_service.resume_active_jobs(
+                    rules_by_id,
+                    rule_id=rule_id,
+                )
         while not self._stop_event.is_set():
-            await self._crawl_service.resume_active_jobs(rules_by_id)
             for rule in self._rules:
                 if rule.enabled:
                     await self.run_rule_now(rule)

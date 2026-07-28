@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 
@@ -143,6 +143,7 @@ class CrawlAttemptRow(Base):
     item_count: Mapped[int | None] = mapped_column(Integer)
     started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 class ListingRow(Base):
@@ -168,16 +169,19 @@ class ListingProcessRunRow(Base):
         UniqueConstraint(
             "listing_id",
             "watch_rule_id",
-            name="uq_listing_run_rule",
+            "run_no",
+            name="uq_listing_run_rule_number",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
+    run_no: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
     error_summary: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 class NotificationRow(Base):
@@ -218,6 +222,7 @@ class CrawlAttempt:
     item_count: int | None
     started_at: datetime | None
     finished_at: datetime | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -235,8 +240,11 @@ class ListingProcessRun:
     id: int
     listing_id: int
     watch_rule_id: str
+    run_no: int
     state: ListingRunState
     error_summary: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -274,8 +282,95 @@ class Repository:
         engine = create_engine(f"sqlite:///{database}")
         Base.metadata.create_all(engine)
         repository = cls(engine)
+        repository._migrate_attempt_updated_at()
+        repository._migrate_listing_run_sequence()
         repository._migrate_unfinished_attempt_index()
         return repository
+
+    def _migrate_attempt_updated_at(self) -> None:
+        """Add and conservatively backfill the Attempt recovery heartbeat."""
+        with self._engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    text("PRAGMA table_info('crawl_attempts')")
+                )
+            }
+            if "updated_at" not in columns:
+                connection.execute(
+                    text("ALTER TABLE crawl_attempts ADD COLUMN updated_at DATETIME")
+                )
+            connection.execute(
+                text(
+                    "UPDATE crawl_attempts "
+                    "SET updated_at = CASE "
+                    f"WHEN state IN ({','.join(repr(value) for value in _UNFINISHED_ATTEMPT_STATES)}) "
+                    "THEN CURRENT_TIMESTAMP "
+                    "ELSE COALESCE(finished_at, started_at, CURRENT_TIMESTAMP) END "
+                    "WHERE updated_at IS NULL"
+                )
+            )
+
+    def _migrate_listing_run_sequence(self) -> None:
+        """Rebuild legacy two-column run uniqueness into retryable sequences."""
+        with self._engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    text("PRAGMA table_info('listing_process_runs')")
+                )
+            }
+            if {"run_no", "updated_at"} <= columns:
+                return
+            connection.execute(text("DROP TABLE IF EXISTS listing_process_runs_v2"))
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE listing_process_runs_v2 (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        listing_id INTEGER NOT NULL
+                            REFERENCES listings (id),
+                        watch_rule_id VARCHAR NOT NULL,
+                        run_no INTEGER NOT NULL,
+                        state VARCHAR NOT NULL,
+                        error_summary VARCHAR,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL,
+                        CONSTRAINT uq_listing_run_rule_number
+                            UNIQUE (listing_id, watch_rule_id, run_no)
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO listing_process_runs_v2 (
+                        id, listing_id, watch_rule_id, run_no, state,
+                        error_summary, created_at, updated_at
+                    )
+                    SELECT
+                        id, listing_id, watch_rule_id, 1, state,
+                        error_summary, created_at, created_at
+                    FROM listing_process_runs
+                    """
+                )
+            )
+            old_count = connection.scalar(
+                text("SELECT COUNT(*) FROM listing_process_runs")
+            )
+            new_count = connection.scalar(
+                text("SELECT COUNT(*) FROM listing_process_runs_v2")
+            )
+            if old_count != new_count:
+                raise RuntimeError("listing process run migration count mismatch")
+            connection.execute(text("DROP TABLE listing_process_runs"))
+            connection.execute(
+                text(
+                    "ALTER TABLE listing_process_runs_v2 "
+                    "RENAME TO listing_process_runs"
+                )
+            )
 
     def _migrate_unfinished_attempt_index(self) -> None:
         """Repair old duplicate work before enforcing the partial uniqueness rule."""
@@ -377,6 +472,7 @@ class Repository:
                     job_id=job_id,
                     attempt_no=(current_max or 0) + 1,
                     state=CrawlAttemptState.CREATED.value,
+                    updated_at=_utc_now(),
                 )
                 session.add(row)
                 session.flush()
@@ -403,7 +499,7 @@ class Repository:
             updated = session.execute(
                 update(CrawlAttemptRow)
                 .where(CrawlAttemptRow.id == attempt_id, CrawlAttemptRow.state == current.value)
-                .values(state=target.value, **fields)
+                .values(state=target.value, updated_at=_utc_now(), **fields)
             )
             if updated.rowcount != 1:
                 raise ConcurrentStateChange(f"attempt {attempt_id} changed concurrently")
@@ -449,7 +545,11 @@ class Repository:
         self,
         listing_id: int,
         watch_rule_id: str,
+        *,
+        stale_after: timedelta = timedelta(minutes=5),
     ) -> tuple[int, bool]:
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be positive")
         key_filter = (
             ListingProcessRunRow.listing_id == listing_id,
             ListingProcessRunRow.watch_rule_id == watch_rule_id,
@@ -458,24 +558,72 @@ class Repository:
             with self._sessions.begin() as session:
                 if session.get(ListingRow, listing_id) is None:
                     raise KeyError(f"listing {listing_id} does not exist")
-                existing = session.scalar(
-                    select(ListingProcessRunRow).where(*key_filter)
+                latest = session.scalar(
+                    select(ListingProcessRunRow)
+                    .where(*key_filter)
+                    .order_by(
+                        ListingProcessRunRow.run_no.desc(),
+                        ListingProcessRunRow.id.desc(),
+                    )
+                    .limit(1)
                 )
-                if existing is not None:
-                    return existing.id, False
+                now = _utc_now()
+                next_run_no = 1
+                if latest is not None:
+                    latest_state = ListingRunState(latest.state)
+                    if latest_state in {
+                        ListingRunState.NOTIFIED,
+                        ListingRunState.REJECTED,
+                    }:
+                        return latest.id, False
+                    if latest_state is not ListingRunState.FAILED:
+                        if latest.updated_at > now - stale_after:
+                            return latest.id, False
+                        assert_transition(
+                            latest_state,
+                            ListingRunState.FAILED,
+                            LISTING_RUN_TRANSITIONS,
+                        )
+                        recovered = session.execute(
+                            update(ListingProcessRunRow)
+                            .where(
+                                ListingProcessRunRow.id == latest.id,
+                                ListingProcessRunRow.state == latest.state,
+                            )
+                            .values(
+                                state=ListingRunState.FAILED.value,
+                                error_summary=_sanitize_error_summary(
+                                    "stale process run recovered after restart"
+                                ),
+                                updated_at=now,
+                            )
+                        )
+                        if recovered.rowcount != 1:
+                            raise ConcurrentStateChange(
+                                f"listing process run {latest.id} changed concurrently"
+                            )
+                    next_run_no = latest.run_no + 1
                 row = ListingProcessRunRow(
                     listing_id=listing_id,
                     watch_rule_id=watch_rule_id,
+                    run_no=next_run_no,
                     state=ListingRunState.DISCOVERED.value,
-                    created_at=_utc_now(),
+                    created_at=now,
+                    updated_at=now,
                 )
                 session.add(row)
                 session.flush()
                 return row.id, True
-        except IntegrityError:
+        except (ConcurrentStateChange, IntegrityError):
             with self._sessions() as session:
                 existing = session.scalar(
-                    select(ListingProcessRunRow).where(*key_filter)
+                    select(ListingProcessRunRow)
+                    .where(*key_filter)
+                    .order_by(
+                        ListingProcessRunRow.run_no.desc(),
+                        ListingProcessRunRow.id.desc(),
+                    )
+                    .limit(1)
                 )
                 if existing is None:
                     raise
@@ -503,6 +651,7 @@ class Repository:
                 .values(
                     state=target.value,
                     error_summary=sanitized_error,
+                    updated_at=_utc_now(),
                 )
             )
             if updated.rowcount != 1:
@@ -519,8 +668,11 @@ class Repository:
                 id=row.id,
                 listing_id=row.listing_id,
                 watch_rule_id=row.watch_rule_id,
+                run_no=row.run_no,
                 state=ListingRunState(row.state),
                 error_summary=row.error_summary,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
             )
 
     def queue_notification(
@@ -640,14 +792,17 @@ class Repository:
                 return None
             return CrawlJob(id=row.id, rule_id=row.rule_id, state=CrawlJobState(row.state))
 
-    def active_jobs(self) -> list[ActiveCrawlJob]:
+    def active_jobs(self, rule_id: str | None = None) -> list[ActiveCrawlJob]:
         """Return unfinished jobs with the retry deadline of their latest attempt."""
         with self._sessions() as session:
-            jobs = session.scalars(
+            statement = (
                 select(CrawlJobRow)
                 .where(CrawlJobRow.state == CrawlJobState.ACTIVE.value)
                 .order_by(CrawlJobRow.id)
             )
+            if rule_id is not None:
+                statement = statement.where(CrawlJobRow.rule_id == rule_id)
+            jobs = session.scalars(statement)
             active_jobs: list[ActiveCrawlJob] = []
             for job in jobs:
                 attempt = session.scalar(
@@ -665,6 +820,10 @@ class Repository:
                     )
                 )
             return active_jobs
+
+    def active_job_for_rule(self, rule_id: str) -> ActiveCrawlJob | None:
+        jobs = self.active_jobs(rule_id)
+        return jobs[-1] if jobs else None
 
     def table_names(self) -> list[str]:
         return inspect(self._engine).get_table_names()
@@ -695,4 +854,5 @@ class Repository:
             item_count=row.item_count,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            updated_at=row.updated_at,
         )

@@ -4,18 +4,20 @@ import sqlite3
 from threading import Event
 
 import pytest
-from sqlalchemy import insert, text
+from sqlalchemy import insert, text, update
 from sqlalchemy.exc import IntegrityError
 
 from astrbot_plugin_mercari_agent.domain import (
     CrawlAttemptState,
     CrawlJobState,
     Listing,
+    ListingRunState,
     TransitionError,
 )
 from astrbot_plugin_mercari_agent.storage import (
     ConcurrentStateChange,
     CrawlAttemptRow,
+    ListingProcessRunRow,
     Repository,
 )
 
@@ -322,5 +324,192 @@ def test_open_migrates_old_duplicate_attempts_and_installs_partial_index(tmp_pat
             CrawlAttemptState.FAILED,
             CrawlAttemptState.REQUESTING,
         ]
+    finally:
+        reopened.dispose()
+
+
+def test_failed_listing_run_creates_the_next_run_number(
+    repository: Repository, listing: Listing
+) -> None:
+    listing_id, _ = repository.save_listing(listing)
+    first_id, first_created = repository.get_or_create_listing_run(
+        listing_id, "rule-1"
+    )
+    repository.advance_listing_run(first_id, ListingRunState.FAILED, "temporary")
+
+    second_id, second_created = repository.get_or_create_listing_run(
+        listing_id, "rule-1"
+    )
+
+    assert first_created is True
+    assert second_created is True
+    assert second_id != first_id
+    assert repository.get_listing_run(first_id).run_no == 1
+    assert repository.get_listing_run(second_id).run_no == 2
+    assert repository.get_listing_run(first_id).state is ListingRunState.FAILED
+
+
+def test_stale_listing_run_is_failed_and_retried(
+    repository: Repository, listing: Listing
+) -> None:
+    listing_id, _ = repository.save_listing(listing)
+    first_id, _ = repository.get_or_create_listing_run(listing_id, "rule-1")
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    with repository._engine.begin() as connection:
+        connection.execute(
+            update(ListingProcessRunRow)
+            .where(ListingProcessRunRow.id == first_id)
+            .values(updated_at=stale_at)
+        )
+
+    second_id, created = repository.get_or_create_listing_run(
+        listing_id,
+        "rule-1",
+        stale_after=timedelta(seconds=30),
+    )
+
+    assert created is True
+    assert second_id != first_id
+    first = repository.get_listing_run(first_id)
+    assert first.state is ListingRunState.FAILED
+    assert first.error_summary == "stale process run recovered after restart"
+    assert repository.get_listing_run(second_id).run_no == 2
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [ListingRunState.REJECTED, ListingRunState.NOTIFIED],
+)
+def test_terminal_listing_run_suppresses_reprocessing(
+    repository: Repository,
+    listing: Listing,
+    terminal_state: ListingRunState,
+) -> None:
+    listing_id, _ = repository.save_listing(listing)
+    run_id, _ = repository.get_or_create_listing_run(listing_id, "rule-1")
+    path = [
+        ListingRunState.NORMALIZED,
+        ListingRunState.DEDUP_CHECKED,
+        ListingRunState.RULE_EVALUATED,
+    ]
+    if terminal_state is ListingRunState.REJECTED:
+        path.append(ListingRunState.REJECTED)
+    else:
+        path.extend(
+            [
+                ListingRunState.RAG_RETRIEVED,
+                ListingRunState.AGENT_EVALUATED,
+                ListingRunState.NOTIFICATION_QUEUED,
+                ListingRunState.NOTIFIED,
+            ]
+        )
+    for state in path:
+        repository.advance_listing_run(run_id, state)
+
+    repeated_id, created = repository.get_or_create_listing_run(
+        listing_id, "rule-1"
+    )
+
+    assert repeated_id == run_id
+    assert created is False
+
+
+def test_concurrent_listing_run_get_or_create_returns_one_fresh_run(
+    tmp_path, listing: Listing
+) -> None:
+    database = tmp_path / "listing-run-race.sqlite3"
+    first_repo = Repository.open(database)
+    second_repo = Repository.open(database)
+    listing_id, _ = first_repo.save_listing(listing)
+    gate = Event()
+
+    def create(repo: Repository) -> tuple[int, bool]:
+        gate.wait()
+        return repo.get_or_create_listing_run(listing_id, "rule-1")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(create, first_repo),
+                executor.submit(create, second_repo),
+            ]
+            gate.set()
+            results = [future.result() for future in futures]
+        run_ids = {run_id for run_id, _ in results}
+        assert len(run_ids) == 1
+        assert sum(created for _, created in results) == 1
+        run = first_repo.get_listing_run(next(iter(run_ids)))
+        assert run.run_no == 1
+        assert run.state is ListingRunState.DISCOVERED
+    finally:
+        first_repo.dispose()
+        second_repo.dispose()
+
+
+def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> None:
+    database = tmp_path / "legacy-listing-runs.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE listings (
+                id INTEGER PRIMARY KEY,
+                marketplace VARCHAR NOT NULL,
+                external_id VARCHAR NOT NULL,
+                title VARCHAR NOT NULL,
+                description VARCHAR NOT NULL,
+                price_jpy INTEGER NOT NULL,
+                url VARCHAR NOT NULL,
+                image_url VARCHAR,
+                seller_name VARCHAR,
+                published_at DATETIME,
+                discovered_at DATETIME NOT NULL,
+                CONSTRAINT uq_listing_external UNIQUE (marketplace, external_id)
+            );
+            CREATE TABLE listing_process_runs (
+                id INTEGER PRIMARY KEY,
+                listing_id INTEGER NOT NULL,
+                watch_rule_id VARCHAR NOT NULL,
+                state VARCHAR NOT NULL,
+                error_summary VARCHAR,
+                created_at DATETIME NOT NULL,
+                CONSTRAINT uq_listing_run_rule UNIQUE (listing_id, watch_rule_id)
+            );
+            INSERT INTO listings VALUES (
+                1, 'mercari', 'legacy-1', 'legacy', '', 100,
+                'https://example.invalid/legacy-1', NULL, NULL, NULL,
+                '2026-01-01 00:00:00'
+            );
+            INSERT INTO listing_process_runs VALUES (
+                1, 1, 'rule-1', 'FAILED', 'temporary', '2026-01-01 00:00:00'
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    repository = Repository.open(database)
+    try:
+        legacy = repository.get_listing_run(1)
+        assert legacy.run_no == 1
+        second_id, created = repository.get_or_create_listing_run(1, "rule-1")
+        assert created is True
+        assert repository.get_listing_run(second_id).run_no == 2
+    finally:
+        repository.dispose()
+
+    reopened = Repository.open(database)
+    try:
+        assert reopened.get_listing_run(1).run_no == 1
+        assert reopened.get_listing_run(2).run_no == 2
+        with reopened._engine.connect() as engine_connection:
+            columns = {
+                row[1]
+                for row in engine_connection.execute(
+                    text("PRAGMA table_info('listing_process_runs')")
+                )
+            }
+        assert {"run_no", "updated_at"} <= columns
     finally:
         reopened.dispose()

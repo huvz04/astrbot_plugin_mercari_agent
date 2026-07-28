@@ -23,10 +23,12 @@ from astrbot_plugin_mercari_agent.monitor import (
     RetryPolicy,
 )
 from astrbot_plugin_mercari_agent.storage import (
+    CrawlAttemptRow,
+    CrawlJobRow,
     ListingProcessRunRow,
     Repository,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 
 class SequenceCollector:
@@ -108,11 +110,19 @@ class FailingPollService:
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
-    async def resume_active_jobs(self, rules_by_id: dict[str, WatchRule]) -> None:
+    def active_rule_ids(self) -> tuple[str, ...]:
+        return ("rule-1",)
+
+    async def resume_active_jobs(
+        self,
+        rules_by_id: dict[str, WatchRule],
+        *,
+        rule_id: str | None = None,
+    ) -> None:
         self.started.set()
         raise RuntimeError("poller failed")
 
-    async def run_once(self, rule: WatchRule) -> int:
+    async def run_scheduled(self, rule: WatchRule) -> int:
         return 0
 
 
@@ -543,3 +553,149 @@ def test_retry_policy_classifies_deterministic_failures(
 ) -> None:
     decision = RetryPolicy().classify(error)
     assert (decision.retryable, decision.error_type) == (retryable, error_type)
+
+
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        CrawlAttemptState.CREATED,
+        CrawlAttemptState.REQUESTING,
+        CrawlAttemptState.RECEIVED,
+        CrawlAttemptState.PARSING,
+        CrawlAttemptState.SAVING,
+    ],
+)
+def test_restart_recovery_fails_each_stale_nonterminal_attempt_then_retries(
+    repository: Repository,
+    rule: WatchRule,
+    listing: Listing,
+    stale_state: CrawlAttemptState,
+) -> None:
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    for stage in (
+        CrawlAttemptState.REQUESTING,
+        CrawlAttemptState.RECEIVED,
+        CrawlAttemptState.PARSING,
+        CrawlAttemptState.SAVING,
+    ):
+        if stale_state is CrawlAttemptState.CREATED:
+            break
+        repository.advance_attempt(attempt_id, stage)
+        if stage is stale_state:
+            break
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    with repository._engine.begin() as connection:
+        connection.execute(
+            update(CrawlAttemptRow)
+            .where(CrawlAttemptRow.id == attempt_id)
+            .values(updated_at=stale_at)
+        )
+    collector = SequenceCollector([[listing]])
+    service = CrawlService(
+        repository,
+        collector,
+        RecordingGraph(),
+        max_attempts=3,
+        attempt_stale_after=timedelta(seconds=30),
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+    )
+
+    asyncio.run(service.resume_active_jobs({rule.id: rule}))
+
+    attempts = repository.attempts(job_id)
+    assert [attempt.state for attempt in attempts] == [
+        CrawlAttemptState.FAILED,
+        CrawlAttemptState.SUCCEEDED,
+    ]
+    assert attempts[0].error_type == "crash_recovered"
+    assert attempts[0].error_summary == "stale attempt recovered after restart"
+    assert collector.calls == 1
+    assert repository.get_job(job_id).state is CrawlJobState.SUCCEEDED
+
+
+def test_restart_recovery_finishes_active_job_after_succeeded_attempt(
+    repository: Repository,
+    rule: WatchRule,
+) -> None:
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    for stage in (
+        CrawlAttemptState.REQUESTING,
+        CrawlAttemptState.RECEIVED,
+        CrawlAttemptState.PARSING,
+        CrawlAttemptState.SAVING,
+        CrawlAttemptState.SUCCEEDED,
+    ):
+        repository.advance_attempt(attempt_id, stage)
+    collector = SequenceCollector([])
+    service = _service(repository, collector)
+
+    asyncio.run(service.resume_active_jobs({rule.id: rule}))
+
+    assert repository.get_job(job_id).state is CrawlJobState.SUCCEEDED
+    assert len(repository.attempts(job_id)) == 1
+    assert collector.calls == 0
+
+
+def test_restart_recovery_does_not_steal_a_fresh_nonterminal_attempt(
+    repository: Repository,
+    rule: WatchRule,
+) -> None:
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    repository.advance_attempt(attempt_id, CrawlAttemptState.REQUESTING)
+    collector = SequenceCollector([])
+    service = CrawlService(
+        repository,
+        collector,
+        RecordingGraph(),
+        attempt_stale_after=timedelta(hours=1),
+    )
+
+    asyncio.run(service.resume_active_jobs({rule.id: rule}))
+
+    assert repository.get_job(job_id).state is CrawlJobState.ACTIVE
+    assert repository.get_attempt(attempt_id).state is CrawlAttemptState.REQUESTING
+    assert collector.calls == 0
+
+
+def test_poll_cycle_preserves_future_backoff_without_creating_another_job(
+    repository: Repository,
+    rule: WatchRule,
+) -> None:
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    repository.advance_attempt(attempt_id, CrawlAttemptState.REQUESTING)
+    repository.advance_attempt(
+        attempt_id,
+        CrawlAttemptState.FAILED,
+        error_type="timeout",
+        error_summary="temporary",
+        next_retry_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        finished_at=datetime.now(timezone.utc),
+    )
+    service = _service(repository, SequenceCollector([]))
+    monitor = Monitor(service, [rule], poll_interval=60)
+
+    async def exercise() -> None:
+        await monitor.start()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+    with repository._sessions() as session:
+        job_count = session.scalar(select(func.count()).select_from(CrawlJobRow))
+        attempt_count = session.scalar(
+            select(func.count()).select_from(CrawlAttemptRow)
+        )
+    assert job_count == 1
+    assert attempt_count == 1
+    assert repository.get_job(job_id).state is CrawlJobState.ACTIVE
