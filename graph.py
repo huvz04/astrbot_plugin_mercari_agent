@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -78,12 +79,40 @@ def build_listing_graph(
     def fail_process_run(
         state: ListingGraphState, error: Exception
     ) -> ListingGraphState:
-        repository.advance_listing_run(
-            state["process_run_id"],
+        run = repository.get_listing_run(state["process_run_id"])
+        if run.state not in {
             ListingRunState.FAILED,
-            error_summary=str(error),
-        )
+            ListingRunState.REJECTED,
+            ListingRunState.NOTIFIED,
+        }:
+            repository.advance_listing_run(
+                run.id,
+                ListingRunState.FAILED,
+                error_summary=str(error),
+            )
         return {"errors": [*state.get("errors", ()), str(error)]}
+
+    def guarded_node(
+        node: Callable[[ListingGraphState], ListingGraphState],
+    ) -> Callable[[ListingGraphState], ListingGraphState]:
+        def wrapped(state: ListingGraphState) -> ListingGraphState:
+            try:
+                return node(state)
+            except Exception as error:
+                return fail_process_run(state, error)
+
+        return wrapped
+
+    def guarded_async_node(
+        node: Callable[[ListingGraphState], Awaitable[ListingGraphState]],
+    ) -> Callable[[ListingGraphState], Awaitable[ListingGraphState]]:
+        async def wrapped(state: ListingGraphState) -> ListingGraphState:
+            try:
+                return await node(state)
+            except Exception as error:
+                return fail_process_run(state, error)
+
+        return wrapped
 
     def normalize_node(state: ListingGraphState) -> ListingGraphState:
         raw_listing = state.get("raw_listing", state["listing"])
@@ -106,14 +135,17 @@ def build_listing_graph(
         result["process_run_id"] = run_id
         result["process_run_created"] = run_created
         if run_created:
-            repository.advance_listing_run(
-                run_id,
-                ListingRunState.NORMALIZED,
-            )
-            repository.advance_listing_run(
-                run_id,
-                ListingRunState.DEDUP_CHECKED,
-            )
+            try:
+                repository.advance_listing_run(
+                    run_id,
+                    ListingRunState.NORMALIZED,
+                )
+                repository.advance_listing_run(
+                    run_id,
+                    ListingRunState.DEDUP_CHECKED,
+                )
+            except Exception as error:
+                return {**result, **fail_process_run({**state, **result}, error)}
         return result
 
     def hard_filter_node(state: ListingGraphState) -> ListingGraphState:
@@ -131,12 +163,9 @@ def build_listing_graph(
 
     def retrieve_node(state: ListingGraphState) -> ListingGraphState:
         listing = state["listing"]
-        try:
-            documents = retriever.retrieve(
-                f"{listing.title}\n{listing.description}"
-            )
-        except Exception as error:
-            return fail_process_run(state, error)
+        documents = retriever.retrieve(
+            f"{listing.title}\n{listing.description}"
+        )
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.RAG_RETRIEVED,
@@ -146,13 +175,10 @@ def build_listing_graph(
     async def evaluate_node(
         state: ListingGraphState,
     ) -> ListingGraphState:
-        try:
-            decision = await evaluator.evaluate(
-                state["listing"],
-                state["retrieved_documents"],
-            )
-        except Exception as error:
-            return fail_process_run(state, error)
+        decision = await evaluator.evaluate(
+            state["listing"],
+            state["retrieved_documents"],
+        )
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.AGENT_EVALUATED,
@@ -185,17 +211,14 @@ def build_listing_graph(
         }
 
     async def notify_node(state: ListingGraphState) -> ListingGraphState:
-        try:
-            sent = await notifier.send(
-                state["watch_rule"].target_session,
-                _notification_message(
-                    state["listing"],
-                    state["agent_decision"],
-                    state["retrieved_documents"],
-                ),
-            )
-        except Exception as error:
-            return fail_process_run(state, error)
+        sent = await notifier.send(
+            state["watch_rule"].target_session,
+            _notification_message(
+                state["listing"],
+                state["agent_decision"],
+                state["retrieved_documents"],
+            ),
+        )
         if not sent:
             error = "notification send returned false"
             repository.advance_listing_run(
@@ -214,27 +237,35 @@ def build_listing_graph(
     builder = StateGraph(ListingGraphState)
     builder.add_node("normalize", normalize_node)
     builder.add_node("deduplicate", deduplicate_node)
-    builder.add_node("hard_filter", hard_filter_node)
-    builder.add_node("retrieve", retrieve_node)
-    builder.add_node("evaluate", evaluate_node)
-    builder.add_node("queue_notification", queue_notification_node)
-    builder.add_node("notify", notify_node)
+    builder.add_node("hard_filter", guarded_node(hard_filter_node))
+    builder.add_node("retrieve", guarded_node(retrieve_node))
+    builder.add_node("evaluate", guarded_async_node(evaluate_node))
+    builder.add_node("queue_notification", guarded_node(queue_notification_node))
+    builder.add_node("notify", guarded_async_node(notify_node))
 
     builder.add_edge(START, "normalize")
     builder.add_edge("normalize", "deduplicate")
     builder.add_conditional_edges(
         "deduplicate",
         lambda state: (
-            "new" if state["process_run_created"] else "duplicate"
+            "failed"
+            if state.get("errors")
+            else "new"
+            if state["process_run_created"]
+            else "duplicate"
         ),
-        {"new": "hard_filter", "duplicate": END},
+        {"new": "hard_filter", "duplicate": END, "failed": END},
     )
     builder.add_conditional_edges(
         "hard_filter",
         lambda state: (
-            "accepted" if state["filter_result"].accepted else "rejected"
+            "failed"
+            if state.get("errors")
+            else "accepted"
+            if state["filter_result"].accepted
+            else "rejected"
         ),
-        {"accepted": "retrieve", "rejected": END},
+        {"accepted": "retrieve", "rejected": END, "failed": END},
     )
     builder.add_conditional_edges(
         "retrieve",
@@ -249,9 +280,13 @@ def build_listing_graph(
     builder.add_conditional_edges(
         "queue_notification",
         lambda state: (
-            "notify" if state["notification_created"] else "duplicate"
+            "failed"
+            if state.get("errors")
+            else "notify"
+            if state["notification_created"]
+            else "duplicate"
         ),
-        {"notify": "notify", "duplicate": END},
+        {"notify": "notify", "duplicate": END, "failed": END},
     )
     builder.add_edge("notify", END)
     return builder.compile()

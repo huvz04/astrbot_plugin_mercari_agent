@@ -1,8 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from threading import Event
 
 import pytest
+from sqlalchemy import insert, text
+from sqlalchemy.exc import IntegrityError
 
 from astrbot_plugin_mercari_agent.domain import (
     CrawlAttemptState,
@@ -10,7 +13,11 @@ from astrbot_plugin_mercari_agent.domain import (
     Listing,
     TransitionError,
 )
-from astrbot_plugin_mercari_agent.storage import ConcurrentStateChange, Repository
+from astrbot_plugin_mercari_agent.storage import (
+    ConcurrentStateChange,
+    CrawlAttemptRow,
+    Repository,
+)
 
 
 @pytest.fixture
@@ -219,3 +226,79 @@ def test_separate_repository_callers_cannot_create_two_unfinished_attempts(tmp_p
 
     assert sum(isinstance(result, int) for result in results) == 1
     assert sum(isinstance(result, ConcurrentStateChange) for result in results) == 1
+
+
+def test_open_migrates_old_duplicate_attempts_and_installs_partial_index(tmp_path) -> None:
+    database = tmp_path / "old-mercari.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE crawl_jobs (
+                id INTEGER PRIMARY KEY,
+                rule_id VARCHAR NOT NULL,
+                state VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL,
+                started_at DATETIME,
+                finished_at DATETIME
+            );
+            CREATE TABLE crawl_attempts (
+                id INTEGER PRIMARY KEY,
+                job_id INTEGER NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                state VARCHAR NOT NULL,
+                http_status INTEGER,
+                error_type VARCHAR,
+                error_summary VARCHAR,
+                next_retry_at DATETIME,
+                item_count INTEGER,
+                started_at DATETIME,
+                finished_at DATETIME,
+                CONSTRAINT uq_attempt_number UNIQUE (job_id, attempt_no)
+            );
+            INSERT INTO crawl_jobs VALUES (1, 'rule-1', 'ACTIVE', '2026-01-01 00:00:00', '2026-01-01 00:00:00', NULL);
+            INSERT INTO crawl_attempts VALUES (1, 1, 1, 'CREATED', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+            INSERT INTO crawl_attempts VALUES (2, 1, 2, 'REQUESTING', NULL, NULL, NULL, NULL, NULL, '2026-01-01 00:01:00', NULL);
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    repository = Repository.open(database)
+    try:
+        attempts = repository.attempts(1)
+        assert [attempt.state for attempt in attempts] == [
+            CrawlAttemptState.FAILED,
+            CrawlAttemptState.REQUESTING,
+        ]
+        assert attempts[0].error_type == "migration_recovered"
+        assert attempts[0].error_summary == "migration closed duplicate unfinished attempt"
+        assert attempts[0].finished_at is not None
+        assert attempts[0].finished_at.tzinfo is timezone.utc
+        with pytest.raises(IntegrityError):
+            with repository._engine.begin() as engine_connection:
+                engine_connection.execute(
+                    insert(CrawlAttemptRow).values(
+                        job_id=1,
+                        attempt_no=3,
+                        state=CrawlAttemptState.CREATED.value,
+                    )
+                )
+        with repository._engine.connect() as engine_connection:
+            index_names = {
+                row[1]
+                for row in engine_connection.execute(text("PRAGMA index_list('crawl_attempts')"))
+            }
+        assert "uq_unfinished_attempt_per_job" in index_names
+    finally:
+        repository.dispose()
+
+    reopened = Repository.open(database)
+    try:
+        assert [attempt.state for attempt in reopened.attempts(1)] == [
+            CrawlAttemptState.FAILED,
+            CrawlAttemptState.REQUESTING,
+        ]
+    finally:
+        reopened.dispose()

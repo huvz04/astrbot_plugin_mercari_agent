@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from astrbot_plugin_mercari_agent.domain import (
+    AgentDecision,
     CrawlAttemptState,
     CrawlJobState,
     Listing,
@@ -83,6 +84,19 @@ class EmptyRetriever:
 class ThrowingEvaluator:
     async def evaluate(self, listing: Listing, evidence: list[object]) -> object:
         raise RuntimeError("Authorization: Bearer private-token")
+
+
+class PassingEvaluator:
+    async def evaluate(self, listing: Listing, evidence: list[object]) -> AgentDecision:
+        return AgentDecision(
+            score=88,
+            recommendation="HIGH_PRIORITY",
+            reasons=("wanted",),
+            risks=(),
+            retrieved_evidence=(),
+            model_name="test-evaluator",
+            prompt_version="test-v1",
+        )
 
 
 class SuccessfulNotifier:
@@ -292,6 +306,101 @@ def test_compiled_graph_evaluator_failure_fails_process_run_without_rewinding_cr
         repository,
         EmptyRetriever(),
         ThrowingEvaluator(),
+        SuccessfulNotifier(),
+    )
+    service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
+
+    job_id = asyncio.run(service.run_once(rule))
+
+    with repository._sessions() as session:
+        process_run = session.scalar(select(ListingProcessRunRow))
+    assert process_run is not None
+    assert ListingRunState(process_run.state) is ListingRunState.FAILED
+    assert process_run.error_summary == "sensitive error detail redacted"
+    assert repository.latest_job().state is CrawlJobState.SUCCEEDED
+    assert repository.attempts(job_id)[0].state is CrawlAttemptState.SUCCEEDED
+
+
+def test_queue_failure_fails_process_run_without_rewinding_successful_crawl(
+    repository: Repository, rule: WatchRule, listing: Listing, monkeypatch
+) -> None:
+    graph = build_listing_graph(
+        repository,
+        EmptyRetriever(),
+        PassingEvaluator(),
+        SuccessfulNotifier(),
+    )
+
+    def fail_queue(*args: object, **kwargs: object) -> tuple[int, bool]:
+        raise RuntimeError("Authorization: Bearer private-token")
+
+    monkeypatch.setattr(repository, "queue_notification", fail_queue)
+    service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
+
+    job_id = asyncio.run(service.run_once(rule))
+
+    with repository._sessions() as session:
+        process_run = session.scalar(select(ListingProcessRunRow))
+    assert process_run is not None
+    assert ListingRunState(process_run.state) is ListingRunState.FAILED
+    assert process_run.error_summary == "sensitive error detail redacted"
+    assert repository.latest_job().state is CrawlJobState.SUCCEEDED
+    assert repository.attempts(job_id)[0].state is CrawlAttemptState.SUCCEEDED
+
+
+def test_hard_filter_transition_failure_fails_process_run_without_rewinding_crawl(
+    repository: Repository, rule: WatchRule, listing: Listing, monkeypatch
+) -> None:
+    original_advance = repository.advance_listing_run
+
+    def fail_rule_transition(
+        run_id: int,
+        target: ListingRunState,
+        error_summary: object = None,
+    ) -> None:
+        if target is ListingRunState.RULE_EVALUATED:
+            raise RuntimeError("Cookie: private-value")
+        original_advance(run_id, target, error_summary)
+
+    monkeypatch.setattr(repository, "advance_listing_run", fail_rule_transition)
+    graph = build_listing_graph(
+        repository,
+        EmptyRetriever(),
+        PassingEvaluator(),
+        SuccessfulNotifier(),
+    )
+    service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
+
+    job_id = asyncio.run(service.run_once(rule))
+
+    with repository._sessions() as session:
+        process_run = session.scalar(select(ListingProcessRunRow))
+    assert process_run is not None
+    assert ListingRunState(process_run.state) is ListingRunState.FAILED
+    assert process_run.error_summary == "sensitive error detail redacted"
+    assert repository.latest_job().state is CrawlJobState.SUCCEEDED
+    assert repository.attempts(job_id)[0].state is CrawlAttemptState.SUCCEEDED
+
+
+def test_deduplicate_transition_failure_fails_process_run_without_rewinding_crawl(
+    repository: Repository, rule: WatchRule, listing: Listing, monkeypatch
+) -> None:
+    original_advance = repository.advance_listing_run
+
+    def fail_normalize_transition(
+        run_id: int,
+        target: ListingRunState,
+        error_summary: object = None,
+    ) -> None:
+        if target is ListingRunState.NORMALIZED:
+            raise RuntimeError("Cookie: private-value")
+        original_advance(run_id, target, error_summary)
+
+    monkeypatch.setattr(repository, "advance_listing_run", fail_normalize_transition)
+    graph = build_listing_graph(
+        repository,
+        EmptyRetriever(),
+        PassingEvaluator(),
         SuccessfulNotifier(),
     )
     service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]

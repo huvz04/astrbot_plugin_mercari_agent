@@ -65,6 +65,17 @@ class UtcDateTime(TypeDecorator[datetime]):
 _SENSITIVE_ERROR_TEXT = re.compile(
     r"(?:cookie|authorization|bearer|token|password|secret|set-cookie)", re.IGNORECASE
 )
+_UNFINISHED_ATTEMPT_STATES = (
+    CrawlAttemptState.CREATED.value,
+    CrawlAttemptState.REQUESTING.value,
+    CrawlAttemptState.RECEIVED.value,
+    CrawlAttemptState.PARSING.value,
+    CrawlAttemptState.SAVING.value,
+)
+_UNFINISHED_ATTEMPT_INDEX = "uq_unfinished_attempt_per_job"
+_UNFINISHED_ATTEMPT_WHERE = (
+    "state IN ('CREATED', 'REQUESTING', 'RECEIVED', 'PARSING', 'SAVING')"
+)
 
 
 def _sanitize_error_summary(value: object) -> str | None:
@@ -114,12 +125,10 @@ class CrawlAttemptRow(Base):
     __table_args__ = (
         UniqueConstraint("job_id", "attempt_no", name="uq_attempt_number"),
         Index(
-            "uq_unfinished_attempt_per_job",
+            _UNFINISHED_ATTEMPT_INDEX,
             "job_id",
             unique=True,
-            sqlite_where=text(
-                "state IN ('CREATED', 'REQUESTING', 'RECEIVED', 'PARSING', 'SAVING')"
-            ),
+            sqlite_where=text(_UNFINISHED_ATTEMPT_WHERE),
         ),
     )
 
@@ -264,7 +273,54 @@ class Repository:
         database = str(Path(path).resolve())
         engine = create_engine(f"sqlite:///{database}")
         Base.metadata.create_all(engine)
-        return cls(engine)
+        repository = cls(engine)
+        repository._migrate_unfinished_attempt_index()
+        return repository
+
+    def _migrate_unfinished_attempt_index(self) -> None:
+        """Repair old duplicate work before enforcing the partial uniqueness rule."""
+        with self._sessions.begin() as session:
+            duplicate_job_ids = session.scalars(
+                select(CrawlAttemptRow.job_id)
+                .where(CrawlAttemptRow.state.in_(_UNFINISHED_ATTEMPT_STATES))
+                .group_by(CrawlAttemptRow.job_id)
+                .having(func.count(CrawlAttemptRow.id) > 1)
+            )
+            for job_id in duplicate_job_ids:
+                unfinished = list(
+                    session.scalars(
+                        select(CrawlAttemptRow)
+                        .where(
+                            CrawlAttemptRow.job_id == job_id,
+                            CrawlAttemptRow.state.in_(_UNFINISHED_ATTEMPT_STATES),
+                        )
+                        .order_by(
+                            CrawlAttemptRow.attempt_no.desc(),
+                            CrawlAttemptRow.id.desc(),
+                        )
+                    )
+                )
+                for attempt in unfinished[1:]:
+                    session.execute(
+                        update(CrawlAttemptRow)
+                        .where(
+                            CrawlAttemptRow.id == attempt.id,
+                            CrawlAttemptRow.state == attempt.state,
+                        )
+                        .values(
+                            state=CrawlAttemptState.FAILED.value,
+                            error_type="migration_recovered",
+                            error_summary="migration closed duplicate unfinished attempt",
+                            next_retry_at=None,
+                            finished_at=_utc_now(),
+                        )
+                    )
+            session.execute(
+                text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {_UNFINISHED_ATTEMPT_INDEX} "
+                    f"ON crawl_attempts (job_id) WHERE {_UNFINISHED_ATTEMPT_WHERE}"
+                )
+            )
 
     def create_job(self, rule_id: str) -> int:
         with self._sessions.begin() as session:
@@ -307,15 +363,7 @@ class Repository:
                 unfinished = session.scalar(
                     select(CrawlAttemptRow.id).where(
                         CrawlAttemptRow.job_id == job_id,
-                        CrawlAttemptRow.state.in_(
-                            (
-                                CrawlAttemptState.CREATED.value,
-                                CrawlAttemptState.REQUESTING.value,
-                                CrawlAttemptState.RECEIVED.value,
-                                CrawlAttemptState.PARSING.value,
-                                CrawlAttemptState.SAVING.value,
-                            )
-                        ),
+                        CrawlAttemptRow.state.in_(_UNFINISHED_ATTEMPT_STATES),
                     )
                 )
                 if unfinished is not None:
