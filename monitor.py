@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
-from .domain import CrawlAttemptState, CrawlJobState, Listing, WatchRule
+from .domain import (
+    CrawlAttemptState,
+    CrawlJobState,
+    Listing,
+    ListingRunState,
+    WatchRule,
+)
 from .storage import CrawlAttempt, Repository, sanitize_error_summary
 
 
@@ -201,12 +207,12 @@ class CrawlService:
         while True:
             attempt_id = self._repository.create_attempt(job_id)
             attempt = self._repository.get_attempt(attempt_id)
-            succeeded, decision, retry_delay, listings = await self._run_attempt(
+            succeeded, decision, retry_delay, run_ids = await self._run_attempt(
                 attempt, rule
             )
             if succeeded:
                 self._repository.finish_job(job_id, CrawlJobState.SUCCEEDED)
-                await self._process_listings(listings, rule)
+                await self._process_run_ids(run_ids)
                 return
             if not decision.retryable or attempt.attempt_no >= self._max_attempts:
                 self._repository.finish_job(job_id, CrawlJobState.EXHAUSTED)
@@ -217,7 +223,7 @@ class CrawlService:
 
     async def _run_attempt(
         self, attempt: CrawlAttempt, rule: WatchRule
-    ) -> tuple[bool, RetryDecision, float | None, list[Listing]]:
+    ) -> tuple[bool, RetryDecision, float | None, list[int]]:
         try:
             self._repository.advance_attempt(
                 attempt.id,
@@ -232,8 +238,15 @@ class CrawlService:
             ):
                 raise ParseError("collector must return a list of Listing values")
             self._repository.advance_attempt(attempt.id, CrawlAttemptState.SAVING)
+            run_ids: list[int] = []
             for listing in listings:
-                self._repository.save_listing(listing)
+                run_id, _ = self._repository.persist_listing_work(
+                    listing,
+                    rule,
+                    origin_job_id=attempt.job_id,
+                    origin_attempt_id=attempt.id,
+                )
+                run_ids.append(run_id)
             self._repository.advance_attempt(
                 attempt.id,
                 CrawlAttemptState.SUCCEEDED,
@@ -277,20 +290,49 @@ class CrawlService:
             )
             return False, decision, retry_delay, []
 
-        return True, RetryDecision(False, ""), None, listings
+        return True, RetryDecision(False, ""), None, run_ids
 
-    async def _process_listings(
-        self, listings: list[Listing], rule: WatchRule
-    ) -> None:
-        for listing in listings:
+    async def drain_pending_listing_work(self) -> list[Exception]:
+        """Process safe durable work while isolating failures by run."""
+        return await self._process_run_ids(
+            [run.id for run in self._repository.pending_listing_work()]
+        )
+
+    async def _process_run_ids(self, run_ids: list[int]) -> list[Exception]:
+        errors: list[Exception] = []
+        for run_id in run_ids:
             try:
-                await self._graph.ainvoke(
-                    {"listing": listing, "watch_rule": rule}
+                run = self._repository.get_listing_run(run_id)
+                if run.state is not ListingRunState.DISCOVERED:
+                    continue
+                if run.rule_snapshot_json is None:
+                    raise ValueError("listing work has no rule snapshot")
+                rule = WatchRule.model_validate_json(run.rule_snapshot_json)
+                listing = self._repository.get_listing(run.listing_id)
+                result = await self._graph.ainvoke(
+                    {
+                        "listing": listing,
+                        "watch_rule": rule,
+                        "process_run_id": run.id,
+                    }
                 )
-            except Exception:
-                # A listing process run owns evaluator/graph failures.  The
-                # crawl is already safely persisted and must remain successful.
-                pass
+                if isinstance(result, Mapping):
+                    errors.extend(
+                        RuntimeError(str(error))
+                        for error in result.get("errors", ())
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                errors.append(error)
+                current = self._repository.get_listing_run(run_id)
+                if current.state is ListingRunState.DISCOVERED:
+                    self._repository.advance_listing_run(
+                        run_id,
+                        ListingRunState.FAILED,
+                        error_summary=str(error),
+                    )
+        return errors
 
     def _backoff_for(self, attempt_no: int) -> float:
         base = self._BACKOFF_SECONDS[min(attempt_no - 1, len(self._BACKOFF_SECONDS) - 1)]

@@ -374,6 +374,41 @@ def test_invoking_graph_twice_creates_one_run_notification_and_send(
     assert len(notifier.calls) == 1
 
 
+def test_graph_processes_a_precreated_discovered_run_without_duplication(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    listing_id, _ = repository.save_listing(listing)
+    run_id, created = repository.get_or_create_listing_run(
+        listing_id,
+        rule.id,
+    )
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(
+        repository,
+        RecordingRetriever(),
+        FixedEvaluator(),
+        notifier,
+    )
+
+    result = asyncio.run(
+        graph.ainvoke(
+            {
+                "listing": listing,
+                "watch_rule": rule,
+                "process_run_id": run_id,
+            }
+        )
+    )
+
+    assert created is True
+    assert result["process_run_id"] == run_id
+    assert repository.get_listing_run(run_id).state is ListingRunState.NOTIFIED
+    assert _run_count(repository) == 1
+    assert len(notifier.calls) == 1
+
+
 def test_same_listing_under_different_rules_creates_distinct_runs_and_notifications(
     repository: Repository,
     listing: Listing,

@@ -206,10 +206,23 @@ def build_listing_graph(
             "listing_id": listing_id,
             "listing_created": listing_created,
         }
-        run_id, run_created = repository.get_or_create_listing_run(
-            listing_id,
-            state["watch_rule"].id,
-        )
+        supplied_run_id = state.get("process_run_id")
+        if supplied_run_id is not None:
+            supplied_run = repository.get_listing_run(supplied_run_id)
+            if (
+                supplied_run.listing_id != listing_id
+                or supplied_run.watch_rule_id != state["watch_rule"].id
+            ):
+                raise ValueError(
+                    "precreated listing run does not match listing and rule"
+                )
+            run_id = supplied_run.id
+            run_created = supplied_run.state is ListingRunState.DISCOVERED
+        else:
+            run_id, run_created = repository.get_or_create_listing_run(
+                listing_id,
+                state["watch_rule"].id,
+            )
         result["process_run_id"] = run_id
         result["process_run_created"] = run_created
         if run_created:

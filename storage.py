@@ -22,6 +22,7 @@ from .domain import (
     Listing,
     ListingRunState,
     NotificationState,
+    WatchRule,
     assert_transition,
 )
 
@@ -187,6 +188,13 @@ class ListingProcessRunRow(Base):
     run_no: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
     error_summary: Mapped[str | None] = mapped_column(String)
+    rule_snapshot_json: Mapped[str | None] = mapped_column(String)
+    origin_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("crawl_jobs.id")
+    )
+    origin_attempt_id: Mapped[int | None] = mapped_column(
+        ForeignKey("crawl_attempts.id")
+    )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
@@ -256,6 +264,9 @@ class ListingProcessRun:
     run_no: int
     state: ListingRunState
     error_summary: str | None
+    rule_snapshot_json: str | None
+    origin_job_id: int | None
+    origin_attempt_id: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -313,6 +324,7 @@ class Repository:
         repository = cls(engine)
         repository._migrate_attempt_updated_at()
         repository._migrate_listing_run_sequence()
+        repository._migrate_listing_work_metadata()
         repository._migrate_notification_outbox()
         repository._migrate_unfinished_attempt_index()
         return repository
@@ -401,6 +413,29 @@ class Repository:
                     "RENAME TO listing_process_runs"
                 )
             )
+
+    def _migrate_listing_work_metadata(self) -> None:
+        """Add immutable recovery metadata to existing listing runs."""
+        with self._engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    text("PRAGMA table_info('listing_process_runs')")
+                )
+            }
+            additions = {
+                "rule_snapshot_json": "VARCHAR",
+                "origin_job_id": "INTEGER REFERENCES crawl_jobs (id)",
+                "origin_attempt_id": "INTEGER REFERENCES crawl_attempts (id)",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE listing_process_runs "
+                            f"ADD COLUMN {name} {definition}"
+                        )
+                    )
 
     def _migrate_notification_outbox(self) -> None:
         """Add conservative delivery state to legacy notification rows."""
@@ -611,6 +646,146 @@ class Repository:
                     raise
                 return existing.id, False
 
+    def persist_listing_work(
+        self,
+        listing: Listing,
+        rule: WatchRule,
+        *,
+        origin_job_id: int,
+        origin_attempt_id: int,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> tuple[int, bool]:
+        """Atomically persist a Listing and its recoverable DISCOVERED run."""
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be positive")
+        try:
+            with self._sessions.begin() as session:
+                listing_row = session.scalar(
+                    select(ListingRow).where(
+                        ListingRow.marketplace == listing.marketplace,
+                        ListingRow.external_id == listing.external_id,
+                    )
+                )
+                if listing_row is None:
+                    listing_values = listing.model_dump()
+                    listing_values["published_at"] = _as_utc(
+                        listing_values["published_at"]
+                    )
+                    listing_values["discovered_at"] = _as_utc(
+                        listing_values["discovered_at"]
+                    )
+                    listing_row = ListingRow(**listing_values)
+                    session.add(listing_row)
+                    session.flush()
+
+                latest = session.scalar(
+                    select(ListingProcessRunRow)
+                    .where(
+                        ListingProcessRunRow.listing_id == listing_row.id,
+                        ListingProcessRunRow.watch_rule_id == rule.id,
+                    )
+                    .order_by(
+                        ListingProcessRunRow.run_no.desc(),
+                        ListingProcessRunRow.id.desc(),
+                    )
+                    .limit(1)
+                )
+                now = _utc_now()
+                next_run_no = 1
+                if latest is not None:
+                    latest_state = ListingRunState(latest.state)
+                    if latest_state in {
+                        ListingRunState.NOTIFIED,
+                        ListingRunState.REJECTED,
+                    }:
+                        return latest.id, False
+                    if latest_state is not ListingRunState.FAILED:
+                        if latest.updated_at > now - stale_after:
+                            return latest.id, False
+                        assert_transition(
+                            latest_state,
+                            ListingRunState.FAILED,
+                            LISTING_RUN_TRANSITIONS,
+                        )
+                        latest.state = ListingRunState.FAILED.value
+                        latest.error_summary = (
+                            "stale process run recovered after restart"
+                        )
+                        latest.updated_at = now
+                    next_run_no = latest.run_no + 1
+
+                run = ListingProcessRunRow(
+                    listing_id=listing_row.id,
+                    watch_rule_id=rule.id,
+                    run_no=next_run_no,
+                    state=ListingRunState.DISCOVERED.value,
+                    rule_snapshot_json=rule.model_dump_json(),
+                    origin_job_id=origin_job_id,
+                    origin_attempt_id=origin_attempt_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(run)
+                session.flush()
+                return run.id, True
+        except (ConcurrentStateChange, IntegrityError):
+            with self._sessions() as session:
+                existing_listing_id = session.scalar(
+                    select(ListingRow.id).where(
+                        ListingRow.marketplace == listing.marketplace,
+                        ListingRow.external_id == listing.external_id,
+                    )
+                )
+                if existing_listing_id is None:
+                    raise
+                existing = session.scalar(
+                    select(ListingProcessRunRow)
+                    .where(
+                        ListingProcessRunRow.listing_id == existing_listing_id,
+                        ListingProcessRunRow.watch_rule_id == rule.id,
+                    )
+                    .order_by(
+                        ListingProcessRunRow.run_no.desc(),
+                        ListingProcessRunRow.id.desc(),
+                    )
+                    .limit(1)
+                )
+                if existing is None:
+                    raise
+                return existing.id, False
+
+    def get_listing(self, listing_id: int) -> Listing:
+        with self._sessions() as session:
+            row = session.get(ListingRow, listing_id)
+            if row is None:
+                raise KeyError(f"listing {listing_id} does not exist")
+            return Listing(
+                marketplace=row.marketplace,
+                external_id=row.external_id,
+                title=row.title,
+                description=row.description,
+                price_jpy=row.price_jpy,
+                url=row.url,
+                image_url=row.image_url,
+                seller_name=row.seller_name,
+                published_at=row.published_at,
+                discovered_at=row.discovered_at,
+            )
+
+    def pending_listing_work(self) -> list[ListingProcessRun]:
+        """Return only safe, immutable DISCOVERED work in insertion order."""
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(ListingProcessRunRow)
+                .where(
+                    ListingProcessRunRow.state
+                    == ListingRunState.DISCOVERED.value,
+                    ListingProcessRunRow.rule_snapshot_json.is_not(None),
+                )
+                .order_by(ListingProcessRunRow.id)
+            )
+            return [self._listing_run_value(row) for row in rows]
+
     def create_listing_run(self, listing_id: int, watch_rule_id: str) -> int:
         run_id, _ = self.get_or_create_listing_run(
             listing_id,
@@ -741,16 +916,7 @@ class Repository:
             row = session.get(ListingProcessRunRow, run_id)
             if row is None:
                 raise KeyError(f"listing process run {run_id} does not exist")
-            return ListingProcessRun(
-                id=row.id,
-                listing_id=row.listing_id,
-                watch_rule_id=row.watch_rule_id,
-                run_no=row.run_no,
-                state=ListingRunState(row.state),
-                error_summary=row.error_summary,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
+            return self._listing_run_value(row)
 
     def queue_notification_for_run(
         self,
@@ -1166,6 +1332,22 @@ class Repository:
             item_count=row.item_count,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _listing_run_value(row: ListingProcessRunRow) -> ListingProcessRun:
+        return ListingProcessRun(
+            id=row.id,
+            listing_id=row.listing_id,
+            watch_rule_id=row.watch_rule_id,
+            run_no=row.run_no,
+            state=ListingRunState(row.state),
+            error_summary=row.error_summary,
+            rule_snapshot_json=row.rule_snapshot_json,
+            origin_job_id=row.origin_job_id,
+            origin_attempt_id=row.origin_attempt_id,
+            created_at=row.created_at,
             updated_at=row.updated_at,
         )
 

@@ -14,6 +14,7 @@ from astrbot_plugin_mercari_agent.domain import (
     ListingRunState,
     NotificationState,
     TransitionError,
+    WatchRule,
 )
 from astrbot_plugin_mercari_agent.storage import (
     ConcurrentStateChange,
@@ -63,6 +64,42 @@ def test_listing_unique_key_is_durable(repository, listing) -> None:
     assert second_id == first_id
     assert first_created is True
     assert second_created is False
+
+
+def test_persist_listing_work_atomically_records_rule_and_origin(
+    repository: Repository,
+    listing: Listing,
+) -> None:
+    rule = WatchRule(
+        id="rule-durable",
+        name="durable rule",
+        include_keywords=("月村手毬",),
+        exclude_keywords=("ジャンク",),
+        max_price_jpy=1500,
+        interval_seconds=60,
+        target_session="aiocqhttp:group:123",
+    )
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+
+    run_id, created = repository.persist_listing_work(
+        listing,
+        rule,
+        origin_job_id=job_id,
+        origin_attempt_id=attempt_id,
+    )
+
+    run = repository.get_listing_run(run_id)
+    stored_listing = repository.get_listing(run.listing_id)
+    assert created is True
+    assert stored_listing == listing
+    assert run.state is ListingRunState.DISCOVERED
+    assert run.rule_snapshot_json == rule.model_dump_json()
+    assert WatchRule.model_validate_json(run.rule_snapshot_json) == rule
+    assert run.origin_job_id == job_id
+    assert run.origin_attempt_id == attempt_id
+    assert [work.id for work in repository.pending_listing_work()] == [run_id]
 
 
 def test_exact_job_and_dispatched_notification_queries_are_scoped(
@@ -552,6 +589,12 @@ def test_open_idempotently_migrates_legacy_listing_run_uniqueness(tmp_path) -> N
                     text("PRAGMA table_info('listing_process_runs')")
                 )
             }
-        assert {"run_no", "updated_at"} <= columns
+        assert {
+            "run_no",
+            "updated_at",
+            "rule_snapshot_json",
+            "origin_job_id",
+            "origin_attempt_id",
+        } <= columns
     finally:
         reopened.dispose()

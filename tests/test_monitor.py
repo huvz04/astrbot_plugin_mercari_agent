@@ -106,6 +106,24 @@ class SuccessfulNotifier:
         return True
 
 
+class CountingNotifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send(self, target_session: str, text: str) -> bool:
+        self.calls += 1
+        return True
+
+
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class CrashBeforeGraphWork:
+    async def ainvoke(self, state: dict[str, object]) -> dict[str, object]:
+        raise SimulatedProcessCrash("process stopped before graph work")
+
+
 class FailingPollService:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -623,6 +641,139 @@ def test_restart_recovery_fails_each_stale_nonterminal_attempt_then_retries(
     assert attempts[0].error_summary == "stale attempt recovered after restart"
     assert collector.calls == 1
     assert repository.get_job(job_id).state is CrawlJobState.SUCCEEDED
+
+
+def _drain_reopened_listing_work(
+    database,
+    run_id: int,
+) -> tuple[Repository, CountingNotifier]:
+    reopened = Repository.open(database)
+    notifier = CountingNotifier()
+    graph = build_listing_graph(
+        reopened,
+        EmptyRetriever(),
+        PassingEvaluator(),
+        notifier,
+    )
+    service = CrawlService(
+        reopened,
+        SequenceCollector([]),
+        graph,
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+    )
+
+    errors = asyncio.run(service.drain_pending_listing_work())
+
+    assert errors == []
+    assert reopened.get_listing_run(run_id).state is ListingRunState.NOTIFIED
+    assert reopened.count_notifications() == 1
+    assert notifier.calls == 1
+    return reopened, notifier
+
+
+def test_crash_after_durable_run_creation_leaves_recoverable_listing_work(
+    tmp_path,
+    rule: WatchRule,
+    listing: Listing,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "crash-after-durable-run.sqlite3"
+    repository = Repository.open(database)
+    original_advance = repository.advance_attempt
+
+    def crash_before_attempt_success(
+        attempt_id: int,
+        target: CrawlAttemptState,
+        **fields: object,
+    ) -> None:
+        if target is CrawlAttemptState.SUCCEEDED:
+            if len(repository.pending_listing_work()) != 1:
+                raise SimulatedProcessCrash(
+                    "durable run missing before attempt success"
+                )
+            raise SimulatedProcessCrash("after durable run commit")
+        original_advance(attempt_id, target, **fields)
+
+    monkeypatch.setattr(repository, "advance_attempt", crash_before_attempt_success)
+    service = _service(repository, SequenceCollector([[listing]]))
+
+    with pytest.raises(SimulatedProcessCrash, match="durable run"):
+        asyncio.run(service.run_once(rule))
+
+    run = repository.pending_listing_work()[0]
+    assert repository.get_attempt(run.origin_attempt_id).state is CrawlAttemptState.SAVING
+    assert repository.get_job(run.origin_job_id).state is CrawlJobState.ACTIVE
+    repository.dispose()
+
+    reopened, _ = _drain_reopened_listing_work(database, run.id)
+    reopened.dispose()
+
+
+def test_crash_after_attempt_success_keeps_listing_work_for_restart(
+    tmp_path,
+    rule: WatchRule,
+    listing: Listing,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "crash-after-attempt-success.sqlite3"
+    repository = Repository.open(database)
+    original_finish = repository.finish_job
+
+    def crash_before_job_success(
+        job_id: int,
+        target: CrawlJobState,
+    ) -> None:
+        if target is CrawlJobState.SUCCEEDED:
+            raise SimulatedProcessCrash("after attempt success")
+        original_finish(job_id, target)
+
+    monkeypatch.setattr(repository, "finish_job", crash_before_job_success)
+    service = _service(repository, SequenceCollector([[listing]]))
+
+    with pytest.raises(SimulatedProcessCrash, match="attempt success"):
+        asyncio.run(service.run_once(rule))
+
+    run = repository.pending_listing_work()[0]
+    assert repository.get_attempt(run.origin_attempt_id).state is CrawlAttemptState.SUCCEEDED
+    assert repository.get_job(run.origin_job_id).state is CrawlJobState.ACTIVE
+    repository.dispose()
+
+    reopened = Repository.open(database)
+    recovery = _service(reopened, SequenceCollector([]))
+    asyncio.run(recovery.resume_active_jobs({rule.id: rule}))
+    assert reopened.get_job(run.origin_job_id).state is CrawlJobState.SUCCEEDED
+    reopened.dispose()
+
+    drained, _ = _drain_reopened_listing_work(database, run.id)
+    drained.dispose()
+
+
+def test_crash_after_job_success_keeps_listing_work_for_restart(
+    tmp_path,
+    rule: WatchRule,
+    listing: Listing,
+) -> None:
+    database = tmp_path / "crash-after-job-success.sqlite3"
+    repository = Repository.open(database)
+    service = CrawlService(
+        repository,
+        SequenceCollector([[listing]]),
+        CrashBeforeGraphWork(),
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(SimulatedProcessCrash, match="before graph"):
+        asyncio.run(service.run_once(rule))
+
+    run = repository.pending_listing_work()[0]
+    assert repository.get_attempt(run.origin_attempt_id).state is CrawlAttemptState.SUCCEEDED
+    assert repository.get_job(run.origin_job_id).state is CrawlJobState.SUCCEEDED
+    repository.dispose()
+
+    reopened, _ = _drain_reopened_listing_work(database, run.id)
+    reopened.dispose()
 
 
 def test_restart_recovery_finishes_active_job_after_succeeded_attempt(
