@@ -125,6 +125,7 @@ def app(tmp_path: Path) -> AcceptanceApp:
         max_price_jpy=3000,
         interval_seconds=60,
         target_session="aiocqhttp:group:acceptance",
+        decision_version="acceptance-v1",
     )
     crawl_service = CrawlService(
         repository,

@@ -20,10 +20,14 @@ from .astrbot_adapters import (
     DeterministicEvaluator,
 )
 from .domain import WatchRule, with_stable_rule_id
-from .graph import build_listing_graph, recover_notification_outbox
+from .graph import (
+    build_listing_graph,
+    drain_queued_notifications,
+    recover_notification_outbox,
+)
 from .monitor import CrawlService, MockCollector, Monitor
 from .rag import MarkdownChromaRetriever
-from .storage import Repository
+from .storage import Repository, sanitize_error_summary
 
 _PLUGIN_NAME = "astrbot_plugin_mercari_agent"
 _USAGE = "用法：/煤炉监控 <关键词> <最高价>（最高价为非负整数 JPY）"
@@ -50,6 +54,7 @@ class MercariAgentPlugin(Star):
         self.crawl_service: CrawlService | None = None
         self.monitor: Monitor | None = None
         self.watch_rule: WatchRule | None = None
+        self._last_startup_maintenance_error: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._enabled = bool(self._get("enabled", False))
         self._use_mock_collector = bool(self._get("use_mock_collector", True))
@@ -100,7 +105,35 @@ class MercariAgentPlugin(Star):
             self.graph, self.crawl_service = self._build_pipeline(
                 self.evaluator
             )
-            await recover_notification_outbox(repository, self.notifier)
+            startup_errors: list[Exception] = []
+            try:
+                startup_errors.extend(
+                    await self.crawl_service.drain_pending_listing_work()
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                startup_errors.append(error)
+            try:
+                startup_errors.extend(
+                    await recover_notification_outbox(
+                        repository,
+                        self.notifier,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                startup_errors.append(error)
+            for error in startup_errors:
+                self._last_startup_maintenance_error = (
+                    sanitize_error_summary(str(error))
+                    or "maintenance error"
+                )
+                logger.warning(
+                    "Mercari maintenance failed: "
+                    f"{self._last_startup_maintenance_error}"
+                )
             self.watch_rule = self._build_watch_rule(self._target_session)
 
             if not self._use_mock_collector:
@@ -156,6 +189,11 @@ class MercariAgentPlugin(Star):
             if self.monitor is not None
             else None
         )
+        maintenance_error = (
+            getattr(self.monitor, "last_maintenance_error", None)
+            if self.monitor is not None
+            else None
+        ) or self._last_startup_maintenance_error
         rule_text = (
             f"关键词={','.join(rule.include_keywords) or '-'}，"
             f"最高价={rule.max_price_jpy} JPY，目标={rule.target_session or '-'}"
@@ -181,6 +219,7 @@ class MercariAgentPlugin(Star):
                         else "下次重试：-"
                     ),
                     f"轮询错误：{poll_error or '-'}",
+                    f"维护错误：{maintenance_error or '-'}",
                 )
             )
         )
@@ -345,7 +384,34 @@ class MercariAgentPlugin(Star):
             self.crawl_service,
             [self.watch_rule],
             poll_interval=self._poll_interval,
+            maintenance=self._drain_normal_maintenance,
         )
+
+    async def _drain_normal_maintenance(self) -> list[Exception]:
+        assert self.crawl_service is not None
+        assert self.repository is not None
+        assert self.notifier is not None
+        errors: list[Exception] = []
+        try:
+            errors.extend(
+                await self.crawl_service.drain_pending_listing_work()
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            errors.append(error)
+        try:
+            errors.extend(
+                await drain_queued_notifications(
+                    self.repository,
+                    self.notifier,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            errors.append(error)
+        return errors
 
     def _build_watch_rule(self, target_session: str) -> WatchRule:
         max_price = max(0, self._int_config("max_price_jpy", 3000))

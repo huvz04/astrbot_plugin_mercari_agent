@@ -136,6 +136,19 @@ def test_persist_listing_work_rejects_invalid_origin_without_saving_listing(
         assert session.query(ListingRow).count() == 0
         assert session.query(ListingProcessRunRow).count() == 0
 
+    repository.save_listing(listing)
+    with pytest.raises(ConcurrentStateChange, match="SAVING"):
+        repository.persist_listing_work(
+            listing,
+            rule,
+            origin_job_id=job_id,
+            origin_attempt_id=attempt_id,
+        )
+
+    with repository._sessions() as session:
+        assert session.query(ListingRow).count() == 1
+        assert session.query(ListingProcessRunRow).count() == 0
+
 
 def test_exact_job_and_dispatched_notification_queries_are_scoped(
     repository, listing

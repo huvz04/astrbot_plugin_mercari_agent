@@ -54,11 +54,15 @@ async def dispatch_notification(
     repository: Repository,
     notifier: Notifier,
     notification_id: int,
+    *,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> NotificationState:
     """Claim and finalize one persisted notification without blind resends."""
     try:
         notification = repository.claim_notification(notification_id)
-    except Exception:
+    except Exception as error:
+        if on_error is not None:
+            on_error(error)
         return repository.get_notification(notification_id).state
     if notification is None:
         return repository.get_notification(notification_id).state
@@ -77,6 +81,8 @@ async def dispatch_notification(
         finally:
             raise
     except Exception as error:
+        if on_error is not None:
+            on_error(error)
         repository.mark_notification_verify_required(notification_id, str(error))
         return NotificationState.VERIFY_REQUIRED
 
@@ -85,6 +91,8 @@ async def dispatch_notification(
             repository.finalize_notification_sent(notification_id)
             return NotificationState.SENT
         except Exception as error:
+            if on_error is not None:
+                on_error(error)
             try:
                 repository.mark_notification_verify_required(
                     notification_id,
@@ -101,6 +109,8 @@ async def dispatch_notification(
         )
         return NotificationState.FAILED_KNOWN
     except Exception as error:
+        if on_error is not None:
+            on_error(error)
         try:
             repository.mark_notification_verify_required(
                 notification_id,
@@ -111,14 +121,34 @@ async def dispatch_notification(
         return repository.get_notification(notification_id).state
 
 
+async def drain_queued_notifications(
+    repository: Repository,
+    notifier: Notifier,
+) -> list[Exception]:
+    """Dispatch only safe QUEUED rows, isolating each notification failure."""
+    errors: list[Exception] = []
+    for notification in repository.queued_notifications():
+        try:
+            await dispatch_notification(
+                repository,
+                notifier,
+                notification.id,
+                on_error=errors.append,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
 async def recover_notification_outbox(
     repository: Repository,
     notifier: Notifier,
-) -> None:
+) -> list[Exception]:
     """Conservatively reconcile uncertain sends, then dispatch safe queued work."""
     repository.reconcile_sending_notifications()
-    for notification in repository.queued_notifications():
-        await dispatch_notification(repository, notifier, notification.id)
+    return await drain_queued_notifications(repository, notifier)
 
 
 def _notification_message(

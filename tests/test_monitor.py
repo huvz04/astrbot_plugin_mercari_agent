@@ -161,6 +161,7 @@ def rule() -> WatchRule:
         include_keywords=("缶バッジ",),
         interval_seconds=60,
         target_session="aiocqhttp:group:123",
+        decision_version="test-v1",
     )
 
 
@@ -415,18 +416,14 @@ def test_hard_filter_transition_failure_fails_process_run_without_rewinding_craw
 def test_deduplicate_transition_failure_fails_process_run_without_rewinding_crawl(
     repository: Repository, rule: WatchRule, listing: Listing, monkeypatch
 ) -> None:
-    original_advance = repository.advance_listing_run
+    def fail_normalize_claim(run_id: int) -> bool:
+        raise RuntimeError("Cookie: private-value")
 
-    def fail_normalize_transition(
-        run_id: int,
-        target: ListingRunState,
-        error_summary: object = None,
-    ) -> None:
-        if target is ListingRunState.NORMALIZED:
-            raise RuntimeError("Cookie: private-value")
-        original_advance(run_id, target, error_summary)
-
-    monkeypatch.setattr(repository, "advance_listing_run", fail_normalize_transition)
+    monkeypatch.setattr(
+        repository,
+        "claim_discovered_listing_run",
+        fail_normalize_claim,
+    )
     graph = build_listing_graph(
         repository,
         EmptyRetriever(),
@@ -529,6 +526,59 @@ def test_monitor_records_startup_recovery_error_and_continues_polling(
     assert monitor.running is False
     assert monitor.task is None
     assert monitor.last_poll_error == "sensitive error detail redacted"
+
+
+def test_monitor_retries_maintenance_and_exposes_only_sanitized_error(
+    rule: WatchRule,
+) -> None:
+    class IdleService:
+        def active_rule_ids(self) -> tuple[str, ...]:
+            return ()
+
+        async def resume_active_jobs(
+            self,
+            rules_by_id: dict[str, WatchRule],
+            *,
+            rule_id: str | None = None,
+        ) -> None:
+            return None
+
+        async def run_scheduled(self, rule: WatchRule) -> int:
+            return 0
+
+    maintenance_calls = 0
+    second_cycle = asyncio.Event()
+
+    async def maintenance() -> list[Exception]:
+        nonlocal maintenance_calls
+        maintenance_calls += 1
+        if maintenance_calls == 1:
+            return [RuntimeError("Authorization: private-token")]
+        second_cycle.set()
+        return []
+
+    monitor = Monitor(
+        IdleService(),
+        [rule.model_copy(update={"enabled": False})],
+        poll_interval=60,
+        error_delay=0.001,
+        maintenance=maintenance,
+    )  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        await monitor.start()
+        await asyncio.wait_for(second_cycle.wait(), timeout=1)
+        assert monitor.running is True
+        await monitor.stop()
+
+    asyncio.run(exercise())
+
+    assert maintenance_calls == 2
+    assert (
+        monitor.last_maintenance_error
+        == "sensitive error detail redacted"
+    )
+    assert monitor.running is False
 
 
 def test_cancelling_a_crawl_terminalizes_attempt_and_recovery_retries_it(

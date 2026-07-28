@@ -357,6 +357,9 @@ class Monitor:
         *,
         poll_interval: float,
         error_delay: float = 1.0,
+        maintenance: (
+            Callable[[], Awaitable[list[Exception]]] | None
+        ) = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -366,10 +369,13 @@ class Monitor:
         self._rules = tuple(rules)
         self._poll_interval = poll_interval
         self._error_delay = min(error_delay, poll_interval, 5.0)
+        self._maintenance = maintenance
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._rule_locks: dict[str, asyncio.Lock] = {}
+        self._maintenance_lock = asyncio.Lock()
         self._last_poll_error: str | None = None
+        self._last_maintenance_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -382,6 +388,10 @@ class Monitor:
     @property
     def last_poll_error(self) -> str | None:
         return self._last_poll_error
+
+    @property
+    def last_maintenance_error(self) -> str | None:
+        return self._last_maintenance_error
 
     async def start(self) -> None:
         if self.running:
@@ -411,9 +421,26 @@ class Monitor:
         state = "running" if self.running else "stopped"
         return f"Mercari monitor: {state}; rules={len(self._rules)}"
 
+    async def run_maintenance(self) -> bool:
+        """Run one isolated safe-work drain under the maintenance lock."""
+        if self._maintenance is None:
+            return False
+        async with self._maintenance_lock:
+            try:
+                errors = await self._maintenance()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                errors = [error]
+        for error in errors:
+            self._last_maintenance_error = (
+                sanitize_error_summary(str(error)) or "maintenance error"
+            )
+        return bool(errors)
+
     async def _poll(self) -> None:
         rules_by_id = {rule.id: rule for rule in self._rules}
-        startup_failed = False
+        startup_failed = await self.run_maintenance()
         try:
             active_rule_ids = self._crawl_service.active_rule_ids()
         except asyncio.CancelledError:
@@ -438,7 +465,7 @@ class Monitor:
         if startup_failed:
             await self._wait(self._error_delay)
         while not self._stop_event.is_set():
-            cycle_failed = False
+            cycle_failed = await self.run_maintenance()
             for rule in self._rules:
                 if rule.enabled:
                     try:

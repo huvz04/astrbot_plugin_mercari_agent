@@ -13,6 +13,7 @@ from astrbot_plugin_mercari_agent.domain import (
     NotificationState,
 )
 from astrbot_plugin_mercari_agent.graph import (
+    drain_queued_notifications,
     dispatch_notification,
     recover_notification_outbox,
 )
@@ -247,6 +248,49 @@ def test_claim_failure_never_calls_external_notifier(
         repository.get_listing_run(run_id).state
         is ListingRunState.NOTIFICATION_QUEUED
     )
+
+
+def test_two_normal_cycles_retry_transient_claim_failure_exactly_once(
+    repository: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run_id = _ready_run(repository)
+    notification_id, _ = _queue(repository, run_id)
+    notifier = RecordingNotifier(True)
+    real_claim = repository.claim_notification
+    claim_calls = 0
+
+    def transient_claim(notification_id: int):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            raise RuntimeError("Authorization: private")
+        return real_claim(notification_id)
+
+    monkeypatch.setattr(repository, "claim_notification", transient_claim)
+
+    first_errors = asyncio.run(
+        drain_queued_notifications(repository, notifier)
+    )
+    second_errors = asyncio.run(
+        drain_queued_notifications(repository, notifier)
+    )
+    third_errors = asyncio.run(
+        drain_queued_notifications(repository, notifier)
+    )
+
+    assert [str(error) for error in first_errors] == [
+        "Authorization: private"
+    ]
+    assert second_errors == []
+    assert third_errors == []
+    assert claim_calls == 2
+    assert notifier.calls == [("aiocqhttp:group:123", "hello")]
+    assert (
+        repository.get_notification(notification_id).state
+        is NotificationState.SENT
+    )
+    assert repository.get_listing_run(run_id).state is ListingRunState.NOTIFIED
 
 
 def test_finalization_failure_after_platform_acceptance_requires_verification(

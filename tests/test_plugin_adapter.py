@@ -312,10 +312,18 @@ class DummyRetriever:
 class RecordingMonitor:
     instances: list["RecordingMonitor"] = []
 
-    def __init__(self, crawl_service, rules, *, poll_interval: float) -> None:
+    def __init__(
+        self,
+        crawl_service,
+        rules,
+        *,
+        poll_interval: float,
+        maintenance=None,
+    ) -> None:
         self.crawl_service = crawl_service
         self.rules = tuple(rules)
         self.poll_interval = poll_interval
+        self.maintenance = maintenance
         self.start_calls = 0
         self.stop_calls = 0
         self.running = False
@@ -345,8 +353,10 @@ def _patch_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         lambda *args, **kwargs: DummyRetriever(),
     )
 
-    async def recover_notification_outbox(repository, notifier) -> None:
-        return None
+    async def recover_notification_outbox(
+        repository, notifier
+    ) -> list[Exception]:
+        return []
 
     monkeypatch.setattr(
         plugin_main,
@@ -524,8 +534,9 @@ def test_initialize_recovers_persisted_notification_outbox_before_monitor(
     _patch_runtime(monkeypatch, tmp_path)
     recovered: list[tuple[object, object]] = []
 
-    async def record_recovery(repository, notifier) -> None:
+    async def record_recovery(repository, notifier) -> list[Exception]:
         recovered.append((repository, notifier))
+        return []
 
     monkeypatch.setattr(
         plugin_main,
@@ -538,6 +549,60 @@ def test_initialize_recovers_persisted_notification_outbox_before_monitor(
 
     assert recovered == [(plugin.repository, plugin.notifier)]
     asyncio.run(plugin.terminate())
+
+
+def test_initialize_and_monitor_cycles_drain_safe_listing_and_outbox_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    events: list[str] = []
+
+    async def drain_listing_work(crawl_service) -> list[Exception]:
+        events.append("listing")
+        return []
+
+    async def recover_outbox(repository, notifier) -> list[Exception]:
+        events.append("startup-outbox")
+        return []
+
+    async def drain_outbox(repository, notifier) -> list[Exception]:
+        events.append("queued-outbox")
+        return []
+
+    monkeypatch.setattr(
+        plugin_main.CrawlService,
+        "drain_pending_listing_work",
+        drain_listing_work,
+    )
+    monkeypatch.setattr(
+        plugin_main,
+        "recover_notification_outbox",
+        recover_outbox,
+    )
+    monkeypatch.setattr(
+        plugin_main,
+        "drain_queued_notifications",
+        drain_outbox,
+        raising=False,
+    )
+    plugin = MercariAgentPlugin(FakeContext(), {})
+
+    async def exercise() -> list[Exception]:
+        await plugin.initialize()
+        assert plugin.monitor is not None
+        assert plugin.monitor.maintenance is not None
+        startup_events = list(events)
+        events.clear()
+        maintenance_errors = await plugin.monitor.maintenance()
+        assert startup_events == ["listing", "startup-outbox"]
+        await plugin.terminate()
+        return maintenance_errors
+
+    maintenance_errors = asyncio.run(exercise())
+
+    assert maintenance_errors == []
+    assert events == ["listing", "queued-outbox"]
 
 
 def test_blank_target_test_uses_event_session_chat_provider(
@@ -775,6 +840,7 @@ def test_status_exposes_the_last_sanitized_poll_error() -> None:
     plugin.monitor = SimpleNamespace(
         running=True,
         last_poll_error="sensitive error detail redacted",
+        last_maintenance_error="sensitive error detail redacted",
     )
 
     result = asyncio.run(
@@ -782,6 +848,7 @@ def test_status_exposes_the_last_sanitized_poll_error() -> None:
     )
 
     assert "轮询错误：sensitive error detail redacted" in result[0]
+    assert "维护错误：sensitive error detail redacted" in result[0]
 
 
 def test_terminate_twice_stops_monitor_and_disposes_repository() -> None:
