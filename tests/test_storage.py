@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 import pytest
 
@@ -8,7 +10,7 @@ from astrbot_plugin_mercari_agent.domain import (
     Listing,
     TransitionError,
 )
-from astrbot_plugin_mercari_agent.storage import Repository
+from astrbot_plugin_mercari_agent.storage import ConcurrentStateChange, Repository
 
 
 @pytest.fixture
@@ -80,39 +82,34 @@ def test_unknown_attempt_fields_are_rejected(repository) -> None:
 def test_attempt_field_sanitization_redacts_secrets_and_response_bodies(repository) -> None:
     job_id = repository.create_job("rule-1")
     repository.activate_job(job_id)
-    secret_attempts = [repository.create_attempt(job_id) for _ in range(5)]
-    body_attempt = repository.create_attempt(job_id)
-    long_body_attempt = repository.create_attempt(job_id)
+    def fail_attempt(unsafe_summary: str, **fields: object) -> int:
+        attempt_id = repository.create_attempt(job_id)
+        repository.advance_attempt(
+            attempt_id,
+            CrawlAttemptState.FAILED,
+            error_summary=unsafe_summary,
+            **fields,
+        )
 
-    for attempt_id, unsafe_summary in zip(
-        secret_attempts,
-        (
+        return attempt_id
+
+    secret_attempts = [
+        fail_attempt(
+            unsafe_summary,
+            http_status=401,
+            error_type="RequestError",
+            item_count=0,
+        )
+        for unsafe_summary in (
             "Cookie: session=private-value",
             "Authorization: Bearer top-secret-token",
             "token=private-value",
             "password=private-value",
             "secret=private-value",
-        ),
-        strict=True,
-    ):
-        repository.advance_attempt(
-            attempt_id,
-            CrawlAttemptState.FAILED,
-            http_status=401,
-            error_type="RequestError",
-            error_summary=unsafe_summary,
-            item_count=0,
         )
-    repository.advance_attempt(
-        body_attempt,
-        CrawlAttemptState.FAILED,
-        error_summary='{"complete": "response body"}',
-    )
-    repository.advance_attempt(
-        long_body_attempt,
-        CrawlAttemptState.FAILED,
-        error_summary="x" * 241,
-    )
+    ]
+    body_attempt = fail_attempt('{"complete": "response body"}')
+    long_body_attempt = fail_attempt("x" * 241)
 
     secret = repository.get_attempt(secret_attempts[0])
     body = repository.get_attempt(body_attempt)
@@ -183,3 +180,42 @@ def test_status_snapshot_reports_latest_job_and_attempt_count(repository) -> Non
     assert snapshot.job_state is CrawlJobState.CANCELLED
     assert snapshot.attempt_count == 1
     assert snapshot.notification_count == 0
+
+
+def test_separate_repository_callers_cannot_create_two_unfinished_attempts(tmp_path) -> None:
+    database = tmp_path / "mercari.sqlite3"
+    first_repo = Repository.open(database)
+    second_repo = Repository.open(database)
+    job_id = first_repo.create_job("rule-1")
+    first_repo.activate_job(job_id)
+    first_committed = Event()
+
+    def create_first() -> int | Exception:
+        try:
+            return first_repo.create_attempt(job_id)
+        except Exception as error:
+            return error
+        finally:
+            first_committed.set()
+
+    def create_second() -> int | Exception:
+        first_committed.wait()
+        try:
+            return second_repo.create_attempt(job_id)
+        except Exception as error:
+            return error
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(create_first)
+            second = executor.submit(create_second)
+            results = [
+                first.result(),
+                second.result(),
+            ]
+    finally:
+        first_repo.dispose()
+        second_repo.dispose()
+
+    assert sum(isinstance(result, int) for result in results) == 1
+    assert sum(isinstance(result, ConcurrentStateChange) for result in results) == 1

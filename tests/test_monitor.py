@@ -9,8 +9,10 @@ from astrbot_plugin_mercari_agent.domain import (
     CrawlAttemptState,
     CrawlJobState,
     Listing,
+    ListingRunState,
     WatchRule,
 )
+from astrbot_plugin_mercari_agent.graph import build_listing_graph
 from astrbot_plugin_mercari_agent.monitor import (
     CrawlService,
     HttpStatusError,
@@ -19,7 +21,11 @@ from astrbot_plugin_mercari_agent.monitor import (
     ParseError,
     RetryPolicy,
 )
-from astrbot_plugin_mercari_agent.storage import Repository
+from astrbot_plugin_mercari_agent.storage import (
+    ListingProcessRunRow,
+    Repository,
+)
+from sqlalchemy import select
 
 
 class SequenceCollector:
@@ -56,6 +62,44 @@ class BlockingCollector:
         self.started.set()
         await self.release.wait()
         return []
+
+
+class BlockingGraph:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ainvoke(self, state: dict[str, object]) -> dict[str, object]:
+        self.started.set()
+        await self.release.wait()
+        return state
+
+
+class EmptyRetriever:
+    def retrieve(self, query: str) -> list[object]:
+        return []
+
+
+class ThrowingEvaluator:
+    async def evaluate(self, listing: Listing, evidence: list[object]) -> object:
+        raise RuntimeError("Authorization: Bearer private-token")
+
+
+class SuccessfulNotifier:
+    async def send(self, target_session: str, text: str) -> bool:
+        return True
+
+
+class FailingPollService:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def resume_active_jobs(self, rules_by_id: dict[str, WatchRule]) -> None:
+        self.started.set()
+        raise RuntimeError("poller failed")
+
+    async def run_once(self, rule: WatchRule) -> int:
+        return 0
 
 
 @pytest.fixture
@@ -221,6 +265,48 @@ def test_graph_failure_does_not_rewind_successful_crawl(
     assert repository.attempts(job_id)[0].state is CrawlAttemptState.SUCCEEDED
 
 
+def test_job_is_succeeded_before_downstream_graph_can_be_cancelled(
+    repository: Repository, rule: WatchRule, listing: Listing
+) -> None:
+    graph = BlockingGraph()
+    service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        task = asyncio.create_task(service.run_once(rule))
+        await graph.started.wait()
+        try:
+            assert repository.latest_job().state is CrawlJobState.SUCCEEDED
+            assert repository.attempts(repository.latest_job().id)[0].state is CrawlAttemptState.SUCCEEDED
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(exercise())
+
+
+def test_compiled_graph_evaluator_failure_fails_process_run_without_rewinding_crawl(
+    repository: Repository, rule: WatchRule, listing: Listing
+) -> None:
+    graph = build_listing_graph(
+        repository,
+        EmptyRetriever(),
+        ThrowingEvaluator(),
+        SuccessfulNotifier(),
+    )
+    service = _service(repository, SequenceCollector([[listing]]), graph)  # type: ignore[arg-type]
+
+    job_id = asyncio.run(service.run_once(rule))
+
+    with repository._sessions() as session:
+        process_run = session.scalar(select(ListingProcessRunRow))
+    assert process_run is not None
+    assert ListingRunState(process_run.state) is ListingRunState.FAILED
+    assert process_run.error_summary == "sensitive error detail redacted"
+    assert repository.latest_job().state is CrawlJobState.SUCCEEDED
+    assert repository.attempts(job_id)[0].state is CrawlAttemptState.SUCCEEDED
+
+
 def test_recovery_continues_due_active_job_with_a_new_attempt(
     repository: Repository, rule: WatchRule, listing: Listing
 ) -> None:
@@ -281,8 +367,26 @@ def test_monitor_lifecycle_is_idempotent_and_leaves_no_running_task(
     assert monitor.task is None
 
 
-def test_cancelling_a_crawl_propagates_cancellation_without_exhausting_job(
-    repository: Repository, rule: WatchRule
+def test_monitor_stop_clears_task_when_the_poller_already_failed(
+    rule: WatchRule,
+) -> None:
+    service = FailingPollService()
+    monitor = Monitor(service, [rule], poll_interval=60)  # type: ignore[arg-type]
+
+    async def exercise() -> None:
+        await monitor.start()
+        await service.started.wait()
+        with pytest.raises(RuntimeError, match="poller failed"):
+            await monitor.stop()
+
+    asyncio.run(exercise())
+
+    assert monitor.running is False
+    assert monitor.task is None
+
+
+def test_cancelling_a_crawl_terminalizes_attempt_and_recovery_retries_it(
+    repository: Repository, rule: WatchRule, listing: Listing
 ) -> None:
     collector = BlockingCollector()
     service = _service(repository, collector)
@@ -296,8 +400,21 @@ def test_cancelling_a_crawl_propagates_cancellation_without_exhausting_job(
 
     asyncio.run(exercise())
 
+    job_id = repository.latest_job().id
+    first_attempt = repository.attempts(job_id)[0]
     assert repository.latest_job().state is CrawlJobState.ACTIVE
-    assert repository.attempts(repository.latest_job().id)[0].state is CrawlAttemptState.REQUESTING
+    assert first_attempt.state is CrawlAttemptState.FAILED
+    assert first_attempt.error_type == "cancelled"
+    assert first_attempt.next_retry_at <= datetime.now(timezone.utc)
+
+    recovery = _service(repository, SequenceCollector([[listing]]))
+    asyncio.run(recovery.resume_active_jobs({rule.id: rule}))
+
+    assert [attempt.state for attempt in repository.attempts(job_id)] == [
+        CrawlAttemptState.FAILED,
+        CrawlAttemptState.SUCCEEDED,
+    ]
+    assert repository.latest_job().state is CrawlJobState.SUCCEEDED
 
 
 @pytest.mark.parametrize(

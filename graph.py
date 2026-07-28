@@ -75,6 +75,16 @@ def build_listing_graph(
     evaluator: Evaluator,
     notifier: Notifier,
 ):
+    def fail_process_run(
+        state: ListingGraphState, error: Exception
+    ) -> ListingGraphState:
+        repository.advance_listing_run(
+            state["process_run_id"],
+            ListingRunState.FAILED,
+            error_summary=str(error),
+        )
+        return {"errors": [*state.get("errors", ()), str(error)]}
+
     def normalize_node(state: ListingGraphState) -> ListingGraphState:
         raw_listing = state.get("raw_listing", state["listing"])
         return {
@@ -121,9 +131,12 @@ def build_listing_graph(
 
     def retrieve_node(state: ListingGraphState) -> ListingGraphState:
         listing = state["listing"]
-        documents = retriever.retrieve(
-            f"{listing.title}\n{listing.description}"
-        )
+        try:
+            documents = retriever.retrieve(
+                f"{listing.title}\n{listing.description}"
+            )
+        except Exception as error:
+            return fail_process_run(state, error)
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.RAG_RETRIEVED,
@@ -133,10 +146,13 @@ def build_listing_graph(
     async def evaluate_node(
         state: ListingGraphState,
     ) -> ListingGraphState:
-        decision = await evaluator.evaluate(
-            state["listing"],
-            state["retrieved_documents"],
-        )
+        try:
+            decision = await evaluator.evaluate(
+                state["listing"],
+                state["retrieved_documents"],
+            )
+        except Exception as error:
+            return fail_process_run(state, error)
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.AGENT_EVALUATED,
@@ -169,14 +185,17 @@ def build_listing_graph(
         }
 
     async def notify_node(state: ListingGraphState) -> ListingGraphState:
-        sent = await notifier.send(
-            state["watch_rule"].target_session,
-            _notification_message(
-                state["listing"],
-                state["agent_decision"],
-                state["retrieved_documents"],
-            ),
-        )
+        try:
+            sent = await notifier.send(
+                state["watch_rule"].target_session,
+                _notification_message(
+                    state["listing"],
+                    state["agent_decision"],
+                    state["retrieved_documents"],
+                ),
+            )
+        except Exception as error:
+            return fail_process_run(state, error)
         if not sent:
             error = "notification send returned false"
             repository.advance_listing_run(
@@ -217,8 +236,16 @@ def build_listing_graph(
         ),
         {"accepted": "retrieve", "rejected": END},
     )
-    builder.add_edge("retrieve", "evaluate")
-    builder.add_edge("evaluate", "queue_notification")
+    builder.add_conditional_edges(
+        "retrieve",
+        lambda state: "failed" if state.get("errors") else "evaluate",
+        {"failed": END, "evaluate": "evaluate"},
+    )
+    builder.add_conditional_edges(
+        "evaluate",
+        lambda state: "failed" if state.get("errors") else "queue_notification",
+        {"failed": END, "queue_notification": "queue_notification"},
+    )
     builder.add_conditional_edges(
         "queue_notification",
         lambda state: (

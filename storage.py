@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, inspect, select, update
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.types import TypeDecorator
@@ -111,7 +111,17 @@ class CrawlJobRow(Base):
 
 class CrawlAttemptRow(Base):
     __tablename__ = "crawl_attempts"
-    __table_args__ = (UniqueConstraint("job_id", "attempt_no", name="uq_attempt_number"),)
+    __table_args__ = (
+        UniqueConstraint("job_id", "attempt_no", name="uq_attempt_number"),
+        Index(
+            "uq_unfinished_attempt_per_job",
+            "job_id",
+            unique=True,
+            sqlite_where=text(
+                "state IN ('CREATED', 'REQUESTING', 'RECEIVED', 'PARSING', 'SAVING')"
+            ),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("crawl_jobs.id"), nullable=False)
@@ -287,8 +297,31 @@ class Repository:
     def create_attempt(self, job_id: int) -> int:
         try:
             with self._sessions.begin() as session:
-                if session.get(CrawlJobRow, job_id) is None:
+                job = session.get(CrawlJobRow, job_id)
+                if job is None:
                     raise KeyError(f"job {job_id} does not exist")
+                if CrawlJobState(job.state) is not CrawlJobState.ACTIVE:
+                    raise ConcurrentStateChange(
+                        f"job {job_id} is not active for a new attempt"
+                    )
+                unfinished = session.scalar(
+                    select(CrawlAttemptRow.id).where(
+                        CrawlAttemptRow.job_id == job_id,
+                        CrawlAttemptRow.state.in_(
+                            (
+                                CrawlAttemptState.CREATED.value,
+                                CrawlAttemptState.REQUESTING.value,
+                                CrawlAttemptState.RECEIVED.value,
+                                CrawlAttemptState.PARSING.value,
+                                CrawlAttemptState.SAVING.value,
+                            )
+                        ),
+                    )
+                )
+                if unfinished is not None:
+                    raise ConcurrentStateChange(
+                        f"job {job_id} already has an unfinished attempt"
+                    )
                 current_max = session.scalar(
                     select(func.max(CrawlAttemptRow.attempt_no)).where(CrawlAttemptRow.job_id == job_id)
                 )

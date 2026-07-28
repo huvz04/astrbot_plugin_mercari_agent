@@ -50,7 +50,14 @@ class RetryPolicy:
     """Classifies only known transient collector failures as retryable."""
 
     _RETRYABLE_TYPES = frozenset(
-        {"timeout", "connection_error", "http_429", "http_5xx", "parse_error"}
+        {
+            "timeout",
+            "connection_error",
+            "http_429",
+            "http_5xx",
+            "parse_error",
+            "cancelled",
+        }
     )
 
     def classify(self, error: BaseException) -> RetryDecision:
@@ -159,9 +166,12 @@ class CrawlService:
         while True:
             attempt_id = self._repository.create_attempt(job_id)
             attempt = self._repository.get_attempt(attempt_id)
-            succeeded, decision, retry_delay = await self._run_attempt(attempt, rule)
+            succeeded, decision, retry_delay, listings = await self._run_attempt(
+                attempt, rule
+            )
             if succeeded:
                 self._repository.finish_job(job_id, CrawlJobState.SUCCEEDED)
+                await self._process_listings(listings, rule)
                 return
             if not decision.retryable or attempt.attempt_no >= self._max_attempts:
                 self._repository.finish_job(job_id, CrawlJobState.EXHAUSTED)
@@ -172,7 +182,7 @@ class CrawlService:
 
     async def _run_attempt(
         self, attempt: CrawlAttempt, rule: WatchRule
-    ) -> tuple[bool, RetryDecision, float | None]:
+    ) -> tuple[bool, RetryDecision, float | None, list[Listing]]:
         try:
             self._repository.advance_attempt(
                 attempt.id,
@@ -196,8 +206,17 @@ class CrawlService:
                 finished_at=datetime.now(timezone.utc),
             )
         except asyncio.CancelledError:
+            cancelled_at = datetime.now(timezone.utc)
+            self._repository.advance_attempt(
+                attempt.id,
+                CrawlAttemptState.FAILED,
+                error_type="cancelled",
+                error_summary="crawl cancelled",
+                next_retry_at=cancelled_at,
+                finished_at=cancelled_at,
+            )
             raise
-        except BaseException as error:
+        except Exception as error:
             decision = self._retry_policy.classify(error)
             retry_delay = (
                 self._backoff_for(attempt.attempt_no)
@@ -221,8 +240,13 @@ class CrawlService:
                 ),
                 finished_at=datetime.now(timezone.utc),
             )
-            return False, decision, retry_delay
+            return False, decision, retry_delay, []
 
+        return True, RetryDecision(False, ""), None, listings
+
+    async def _process_listings(
+        self, listings: list[Listing], rule: WatchRule
+    ) -> None:
         for listing in listings:
             try:
                 await self._graph.ainvoke(
@@ -232,7 +256,6 @@ class CrawlService:
                 # A listing process run owns evaluator/graph failures.  The
                 # crawl is already safely persisted and must remain successful.
                 pass
-        return True, RetryDecision(False, ""), None
 
     def _backoff_for(self, attempt_no: int) -> float:
         base = self._BACKOFF_SECONDS[min(attempt_no - 1, len(self._BACKOFF_SECONDS) - 1)]
@@ -290,7 +313,8 @@ class Monitor:
             await task
         except asyncio.CancelledError:
             pass
-        self._task = None
+        finally:
+            self._task = None
 
     async def run_rule_now(self, rule: WatchRule) -> int:
         lock = self._rule_locks.setdefault(rule.id, asyncio.Lock())
