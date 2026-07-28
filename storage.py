@@ -202,6 +202,16 @@ class CrawlAttempt:
 
 
 @dataclass(frozen=True)
+class ActiveCrawlJob:
+    """An active job together with its latest persisted retry deadline."""
+
+    id: int
+    rule_id: str
+    state: CrawlJobState
+    next_retry_at: datetime | None
+
+
+@dataclass(frozen=True)
 class ListingProcessRun:
     id: int
     listing_id: int
@@ -523,6 +533,32 @@ class Repository:
             if row is None:
                 return None
             return CrawlJob(id=row.id, rule_id=row.rule_id, state=CrawlJobState(row.state))
+
+    def active_jobs(self) -> list[ActiveCrawlJob]:
+        """Return unfinished jobs with the retry deadline of their latest attempt."""
+        with self._sessions() as session:
+            jobs = session.scalars(
+                select(CrawlJobRow)
+                .where(CrawlJobRow.state == CrawlJobState.ACTIVE.value)
+                .order_by(CrawlJobRow.id)
+            )
+            active_jobs: list[ActiveCrawlJob] = []
+            for job in jobs:
+                attempt = session.scalar(
+                    select(CrawlAttemptRow)
+                    .where(CrawlAttemptRow.job_id == job.id)
+                    .order_by(CrawlAttemptRow.attempt_no.desc())
+                    .limit(1)
+                )
+                active_jobs.append(
+                    ActiveCrawlJob(
+                        id=job.id,
+                        rule_id=job.rule_id,
+                        state=CrawlJobState(job.state),
+                        next_retry_at=(attempt.next_retry_at if attempt else None),
+                    )
+                )
+            return active_jobs
 
     def table_names(self) -> list[str]:
         return inspect(self._engine).get_table_names()
