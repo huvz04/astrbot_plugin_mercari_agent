@@ -332,12 +332,22 @@ class CrawlService:
                 raise
             except Exception as error:
                 errors.append(error)
-                current = self._repository.get_listing_run(run_id)
-                if current.state is ListingRunState.DISCOVERED:
-                    self._repository.advance_listing_run(
-                        run_id,
-                        ListingRunState.FAILED,
-                        error_summary=str(error),
+                try:
+                    current = self._repository.get_listing_run(run_id)
+                    if current.state is ListingRunState.DISCOVERED:
+                        self._repository.advance_listing_run(
+                            run_id,
+                            ListingRunState.FAILED,
+                            error_summary=str(error),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as cleanup_error:
+                    errors.append(
+                        RuntimeError(
+                            sanitize_error_summary(str(cleanup_error))
+                            or "listing work cleanup failed"
+                        )
                     )
         return errors
 

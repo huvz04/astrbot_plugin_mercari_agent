@@ -863,6 +863,115 @@ def test_reopen_recovers_stale_inflight_work_without_recollection(
     reopened.dispose()
 
 
+def test_listing_drain_continues_after_first_run_cleanup_also_fails(
+    repository: Repository,
+    rule: WatchRule,
+    listing: Listing,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_rule = rule.model_copy(
+        update={
+            "id": "rule-cleanup-second",
+            "target_session": "session:cleanup-second",
+        }
+    )
+    second_listing = listing.model_copy(
+        update={
+            "external_id": "m-cleanup-second",
+            "url": "https://example.invalid/items/m-cleanup-second",
+        }
+    )
+
+    def persist_pending(
+        item: Listing,
+        watch_rule: WatchRule,
+    ) -> int:
+        job_id = repository.create_job(watch_rule.id)
+        repository.activate_job(job_id)
+        attempt_id = repository.create_attempt(job_id)
+        for state in (
+            CrawlAttemptState.REQUESTING,
+            CrawlAttemptState.RECEIVED,
+            CrawlAttemptState.PARSING,
+            CrawlAttemptState.SAVING,
+        ):
+            repository.advance_attempt(attempt_id, state)
+        run_id, _ = repository.persist_listing_work(
+            item,
+            watch_rule,
+            origin_job_id=job_id,
+            origin_attempt_id=attempt_id,
+        )
+        return run_id
+
+    first_run_id = persist_pending(listing, rule)
+    second_run_id = persist_pending(second_listing, second_rule)
+
+    class FailingThenTerminalGraph:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def ainvoke(
+            self,
+            state: dict[str, object],
+        ) -> dict[str, object]:
+            run_id = int(state["process_run_id"])
+            self.calls.append(run_id)
+            if run_id == first_run_id:
+                raise RuntimeError("first graph failure")
+            assert repository.claim_discovered_listing_run(run_id)
+            repository.advance_listing_run(
+                run_id,
+                ListingRunState.DEDUP_CHECKED,
+            )
+            repository.advance_listing_run(
+                run_id,
+                ListingRunState.RULE_EVALUATED,
+            )
+            repository.advance_listing_run(
+                run_id,
+                ListingRunState.REJECTED,
+            )
+            return state
+
+    graph = FailingThenTerminalGraph()
+    service = CrawlService(
+        repository,
+        SequenceCollector([]),
+        graph,
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+    )
+    real_get_listing_run = repository.get_listing_run
+    first_reads = 0
+
+    def fail_first_cleanup(run_id: int):
+        nonlocal first_reads
+        if run_id == first_run_id:
+            first_reads += 1
+            if first_reads == 2:
+                raise RuntimeError("Authorization: cleanup-secret")
+        return real_get_listing_run(run_id)
+
+    monkeypatch.setattr(
+        repository,
+        "get_listing_run",
+        fail_first_cleanup,
+    )
+
+    errors = asyncio.run(service.drain_pending_listing_work())
+
+    assert graph.calls == [first_run_id, second_run_id]
+    assert [str(error) for error in errors] == [
+        "first graph failure",
+        "sensitive error detail redacted",
+    ]
+    assert (
+        real_get_listing_run(second_run_id).state
+        is ListingRunState.REJECTED
+    )
+
+
 def test_crash_after_durable_run_creation_leaves_recoverable_listing_work(
     tmp_path,
     rule: WatchRule,
