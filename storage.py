@@ -599,6 +599,31 @@ class Repository:
                 raise KeyError(f"attempt {attempt_id} does not exist")
             return self._attempt_value(row)
 
+    def get_job(self, job_id: int) -> CrawlJob:
+        with self._sessions() as session:
+            row = session.get(CrawlJobRow, job_id)
+            if row is None:
+                raise KeyError(f"job {job_id} does not exist")
+            return CrawlJob(
+                id=row.id,
+                rule_id=row.rule_id,
+                state=CrawlJobState(row.state),
+            )
+
+    def count_sent_notifications(self, watch_rule_id: str) -> int:
+        with self._sessions() as session:
+            return (
+                session.scalar(
+                    select(func.count())
+                    .select_from(NotificationRow)
+                    .where(
+                        NotificationRow.watch_rule_id == watch_rule_id,
+                        NotificationRow.sent_at.is_not(None),
+                    )
+                )
+                or 0
+            )
+
     def attempts(self, job_id: int) -> list[CrawlAttempt]:
         with self._sessions() as session:
             rows = session.scalars(

@@ -1,0 +1,61 @@
+{
+  "enabled": {
+    "description": "启动后台煤炉监控",
+    "type": "bool",
+    "default": false,
+    "hint": "仅在目标会话不为空且使用 MockCollector 时启动。"
+  },
+  "poll_interval_seconds": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "代码会将小于 10 秒的值限制为 10 秒。"
+  },
+  "max_attempts": {
+    "description": "单次任务最多尝试次数",
+    "type": "int",
+    "default": 3,
+    "hint": "代码会限制在 1 到 5 次。"
+  },
+  "target_session": {
+    "description": "主动通知目标会话",
+    "type": "string",
+    "default": "",
+    "hint": "填写 AstrBot unified_msg_origin；留空时 /煤炉测试 和 /煤炉监控 使用当前会话。"
+  },
+  "include_keywords": {
+    "description": "默认包含关键词",
+    "type": "list",
+    "default": [
+      "月村手毬"
+    ],
+    "hint": "MockCollector 结果必须命中至少一个关键词。"
+  },
+  "exclude_keywords": {
+    "description": "排除关键词",
+    "type": "list",
+    "default": [
+      "ジャンク",
+      "欠品"
+    ],
+    "hint": "命中任一关键词时跳过。"
+  },
+  "max_price_jpy": {
+    "description": "默认最高价格（JPY）",
+    "type": "int",
+    "default": 3000,
+    "hint": "必须是非负整数。"
+  },
+  "use_mock_collector": {
+    "description": "使用离线 MockCollector",
+    "type": "bool",
+    "default": true,
+    "hint": "当前骨架没有真实 Mercari 采集器；关闭后后台监控保持停止。"
+  },
+  "embedding_provider_id": {
+    "description": "Embedding Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空时优先使用第一个 AstrBot Embedding Provider；没有 Provider 时使用确定性本地回退。"
+  }
+}

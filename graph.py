@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Protocol, TypedDict
 
@@ -161,10 +162,13 @@ def build_listing_graph(
             )
         return {"filter_result": result}
 
-    def retrieve_node(state: ListingGraphState) -> ListingGraphState:
+    async def retrieve_node(
+        state: ListingGraphState,
+    ) -> ListingGraphState:
         listing = state["listing"]
-        documents = retriever.retrieve(
-            f"{listing.title}\n{listing.description}"
+        documents = await asyncio.to_thread(
+            retriever.retrieve,
+            f"{listing.title}\n{listing.description}",
         )
         repository.advance_listing_run(
             state["process_run_id"],
@@ -238,7 +242,7 @@ def build_listing_graph(
     builder.add_node("normalize", normalize_node)
     builder.add_node("deduplicate", deduplicate_node)
     builder.add_node("hard_filter", guarded_node(hard_filter_node))
-    builder.add_node("retrieve", guarded_node(retrieve_node))
+    builder.add_node("retrieve", guarded_async_node(retrieve_node))
     builder.add_node("evaluate", guarded_async_node(evaluate_node))
     builder.add_node("queue_notification", guarded_node(queue_notification_node))
     builder.add_node("notify", guarded_async_node(notify_node))

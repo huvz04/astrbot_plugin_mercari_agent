@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 
 import pytest
 from sqlalchemy import func, select
@@ -46,6 +47,16 @@ class RecordingRetriever:
     def retrieve(self, query: str) -> list[Evidence]:
         self.queries.append(query)
         return [Evidence(document_id="risk-terms", text="未開封 means unopened")]
+
+
+class ThreadRecordingRetriever(RecordingRetriever):
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread_ids: list[int] = []
+
+    def retrieve(self, query: str) -> list[Evidence]:
+        self.thread_ids.append(threading.get_ident())
+        return super().retrieve(query)
 
 
 class FixedEvaluator:
@@ -108,6 +119,28 @@ def rule() -> WatchRule:
         interval_seconds=60,
         target_session="aiocqhttp:group:123",
     )
+
+
+def test_async_graph_runs_synchronous_retrieval_off_event_loop_thread(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    retriever = ThreadRecordingRetriever()
+    graph = build_listing_graph(
+        repository,
+        retriever,
+        FixedEvaluator(),
+        RecordingNotifier(),
+    )
+
+    async def exercise() -> None:
+        event_loop_thread = threading.get_ident()
+        await graph.ainvoke({"listing": listing, "watch_rule": rule})
+        assert retriever.thread_ids
+        assert retriever.thread_ids[0] != event_loop_thread
+
+    asyncio.run(exercise())
 
 
 def _run_count(repository: Repository) -> int:

@@ -1,0 +1,9 @@
+name: astrbot_plugin_mercari_agent
+display_name: 煤炉捡漏 Agent
+description: 使用离线 MockCollector、持久化任务与 AstrBot Provider 的煤炉捡漏 Agent 骨架。
+short_desc: 离线可测试的煤炉捡漏 Agent 骨架
+version: 0.1.0
+author: dache
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.16"

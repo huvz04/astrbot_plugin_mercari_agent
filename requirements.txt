@@ -1,0 +1,6 @@
+pydantic>=2,<3
+SQLAlchemy>=2,<3
+langgraph>=1,<2
+langchain-core>=1,<2
+langchain-text-splitters>=1,<2
+langchain-chroma>=1,<2

@@ -62,6 +62,28 @@ def test_listing_unique_key_is_durable(repository, listing) -> None:
     assert second_created is False
 
 
+def test_exact_job_and_sent_notification_queries_are_scoped(
+    repository, listing
+) -> None:
+    first_job_id = repository.create_job("rule-test")
+    second_job_id = repository.create_job("rule-other")
+    listing_id, _ = repository.save_listing(listing)
+    notification_id, _ = repository.queue_notification(
+        listing_id,
+        "rule-test",
+        "mercari-v1",
+        "aiocqhttp:group:123",
+        "message",
+    )
+
+    assert repository.get_job(first_job_id).id == first_job_id
+    assert repository.get_job(second_job_id).id == second_job_id
+    assert repository.count_sent_notifications("rule-test") == 0
+    repository.mark_notification_sent(notification_id)
+    assert repository.count_sent_notifications("rule-test") == 1
+    assert repository.count_sent_notifications("rule-other") == 0
+
+
 def test_illegal_attempt_transition_leaves_stored_state_unchanged(repository) -> None:
     job_id = repository.create_job("rule-1")
     repository.activate_job(job_id)
