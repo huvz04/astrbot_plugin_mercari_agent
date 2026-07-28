@@ -79,6 +79,16 @@ _UNFINISHED_ATTEMPT_INDEX = "uq_unfinished_attempt_per_job"
 _UNFINISHED_ATTEMPT_WHERE = (
     "state IN ('CREATED', 'REQUESTING', 'RECEIVED', 'PARSING', 'SAVING')"
 )
+_RECOVERABLE_LISTING_RUN_STATES = (
+    ListingRunState.NORMALIZED.value,
+    ListingRunState.DEDUP_CHECKED.value,
+    ListingRunState.RULE_EVALUATED.value,
+    ListingRunState.RAG_RETRIEVED.value,
+    ListingRunState.AGENT_EVALUATED.value,
+)
+_CRASH_RECOVERED_LISTING_ERROR = (
+    "crash_recovered: stale in-flight listing work"
+)
 
 
 def _sanitize_error_summary(value: object) -> str | None:
@@ -804,6 +814,97 @@ class Repository:
                 .order_by(ListingProcessRunRow.id)
             )
             return [self._listing_run_value(row) for row in rows]
+
+    def recover_stale_listing_work(
+        self,
+        *,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> list[int]:
+        """Replace abandoned snapshotted pre-outbox runs atomically."""
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be positive")
+        cutoff = _utc_now() - stale_after
+        with self._sessions() as session:
+            candidate_ids = list(
+                session.scalars(
+                    select(ListingProcessRunRow.id)
+                    .where(
+                        ListingProcessRunRow.state.in_(
+                            _RECOVERABLE_LISTING_RUN_STATES
+                        ),
+                        ListingProcessRunRow.rule_snapshot_json.is_not(None),
+                        ListingProcessRunRow.updated_at <= cutoff,
+                    )
+                    .order_by(ListingProcessRunRow.id)
+                )
+            )
+
+        replacement_ids: list[int] = []
+        for candidate_id in candidate_ids:
+            replacement_id: int | None = None
+            try:
+                with self._sessions.begin() as session:
+                    row = session.get(ListingProcessRunRow, candidate_id)
+                    if (
+                        row is None
+                        or row.state
+                        not in _RECOVERABLE_LISTING_RUN_STATES
+                        or row.rule_snapshot_json is None
+                        or row.updated_at > cutoff
+                    ):
+                        continue
+                    latest_run_no = session.scalar(
+                        select(func.max(ListingProcessRunRow.run_no)).where(
+                            ListingProcessRunRow.listing_id == row.listing_id,
+                            ListingProcessRunRow.watch_rule_id
+                            == row.watch_rule_id,
+                        )
+                    )
+                    if latest_run_no != row.run_no:
+                        continue
+                    current = ListingRunState(row.state)
+                    assert_transition(
+                        current,
+                        ListingRunState.FAILED,
+                        LISTING_RUN_TRANSITIONS,
+                    )
+                    recovered = session.execute(
+                        update(ListingProcessRunRow)
+                        .where(
+                            ListingProcessRunRow.id == row.id,
+                            ListingProcessRunRow.state == current.value,
+                            ListingProcessRunRow.updated_at <= cutoff,
+                        )
+                        .values(
+                            state=ListingRunState.FAILED.value,
+                            error_summary=_sanitize_error_summary(
+                                _CRASH_RECOVERED_LISTING_ERROR
+                            ),
+                            updated_at=_utc_now(),
+                        )
+                    )
+                    if recovered.rowcount != 1:
+                        continue
+                    now = _utc_now()
+                    replacement = ListingProcessRunRow(
+                        listing_id=row.listing_id,
+                        watch_rule_id=row.watch_rule_id,
+                        run_no=row.run_no + 1,
+                        state=ListingRunState.DISCOVERED.value,
+                        rule_snapshot_json=row.rule_snapshot_json,
+                        origin_job_id=row.origin_job_id,
+                        origin_attempt_id=row.origin_attempt_id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(replacement)
+                    session.flush()
+                    replacement_id = replacement.id
+            except IntegrityError:
+                continue
+            if replacement_id is not None:
+                replacement_ids.append(replacement_id)
+        return replacement_ids
 
     def create_listing_run(self, listing_id: int, watch_rule_id: str) -> int:
         run_id, _ = self.get_or_create_listing_run(

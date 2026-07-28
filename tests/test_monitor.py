@@ -124,6 +124,20 @@ class CrashBeforeGraphWork:
         raise SimulatedProcessCrash("process stopped before graph work")
 
 
+class CrashDuringRetrieval:
+    def retrieve(self, query: str) -> list[object]:
+        raise SimulatedProcessCrash("process stopped during retrieval")
+
+
+class CrashDuringEvaluation:
+    async def evaluate(
+        self,
+        listing: Listing,
+        evidence: list[object],
+    ) -> object:
+        raise SimulatedProcessCrash("process stopped during evaluation")
+
+
 class FailingPollService:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -720,6 +734,133 @@ def _drain_reopened_listing_work(
     assert reopened.count_notifications() == 1
     assert notifier.calls == 1
     return reopened, notifier
+
+
+def _recover_reopened_inflight_work(
+    database,
+    old_run_id: int,
+) -> tuple[Repository, CountingNotifier]:
+    reopened = Repository.open(database)
+    notifier = CountingNotifier()
+    collector = SequenceCollector([])
+    graph = build_listing_graph(
+        reopened,
+        EmptyRetriever(),
+        PassingEvaluator(),
+        notifier,
+    )
+    service = CrawlService(
+        reopened,
+        collector,
+        graph,
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+        listing_run_stale_after=timedelta(seconds=30),
+    )
+
+    errors = asyncio.run(service.drain_pending_listing_work())
+
+    old = reopened.get_listing_run(old_run_id)
+    with reopened._sessions() as session:
+        runs = list(
+            session.scalars(
+                select(ListingProcessRunRow).order_by(
+                    ListingProcessRunRow.run_no
+                )
+            )
+        )
+    assert errors == []
+    assert collector.calls == 0
+    assert old.state is ListingRunState.FAILED
+    assert old.error_summary == (
+        "crash_recovered: stale in-flight listing work"
+    )
+    assert len(runs) == 2
+    assert runs[1].run_no == runs[0].run_no + 1
+    assert ListingRunState(runs[1].state) is ListingRunState.NOTIFIED
+    assert notifier.calls == 1
+    return reopened, notifier
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "abandoned_state"),
+    [
+        ("after_claim", ListingRunState.NORMALIZED),
+        ("retrieval", ListingRunState.RULE_EVALUATED),
+        ("evaluation", ListingRunState.RAG_RETRIEVED),
+    ],
+)
+def test_reopen_recovers_stale_inflight_work_without_recollection(
+    tmp_path,
+    rule: WatchRule,
+    listing: Listing,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str,
+    abandoned_state: ListingRunState,
+) -> None:
+    database = tmp_path / f"crash-{crash_point}.sqlite3"
+    repository = Repository.open(database)
+    retriever: object = EmptyRetriever()
+    evaluator: object = PassingEvaluator()
+    expected_error: type[BaseException] = SimulatedProcessCrash
+
+    if crash_point == "after_claim":
+        original_advance = repository.advance_listing_run
+
+        def crash_after_claim(
+            run_id: int,
+            target: ListingRunState,
+            error_summary: object = None,
+        ) -> None:
+            if target is ListingRunState.DEDUP_CHECKED:
+                raise SimulatedProcessCrash("process stopped after claim")
+            original_advance(run_id, target, error_summary)
+
+        monkeypatch.setattr(
+            repository,
+            "advance_listing_run",
+            crash_after_claim,
+        )
+    elif crash_point == "retrieval":
+        retriever = CrashDuringRetrieval()
+    else:
+        evaluator = CrashDuringEvaluation()
+
+    graph = build_listing_graph(
+        repository,
+        retriever,
+        evaluator,
+        SuccessfulNotifier(),
+    )
+    service = CrawlService(
+        repository,
+        SequenceCollector([[listing]]),
+        graph,
+        sleep=lambda _: asyncio.sleep(0),
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(expected_error):
+        asyncio.run(service.run_once(rule))
+
+    with repository._sessions() as session:
+        abandoned = session.scalar(select(ListingProcessRunRow))
+    assert abandoned is not None
+    assert ListingRunState(abandoned.state) is abandoned_state
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    with repository._engine.begin() as connection:
+        connection.execute(
+            update(ListingProcessRunRow)
+            .where(ListingProcessRunRow.id == abandoned.id)
+            .values(updated_at=stale_at)
+        )
+    repository.dispose()
+
+    reopened, _ = _recover_reopened_inflight_work(
+        database,
+        abandoned.id,
+    )
+    reopened.dispose()
 
 
 def test_crash_after_durable_run_creation_leaves_recoverable_listing_work(

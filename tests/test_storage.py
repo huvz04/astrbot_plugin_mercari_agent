@@ -44,6 +44,53 @@ def listing() -> Listing:
     )
 
 
+def _durable_rule(rule_id: str) -> WatchRule:
+    return WatchRule(
+        id=rule_id,
+        name=rule_id,
+        include_keywords=("月村手毬",),
+        max_price_jpy=1500,
+        interval_seconds=60,
+        target_session=f"session:{rule_id}",
+    )
+
+
+def _saving_origin(
+    repository: Repository,
+    rule_id: str,
+) -> tuple[int, int]:
+    job_id = repository.create_job(rule_id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    for state in (
+        CrawlAttemptState.REQUESTING,
+        CrawlAttemptState.RECEIVED,
+        CrawlAttemptState.PARSING,
+        CrawlAttemptState.SAVING,
+    ):
+        repository.advance_attempt(attempt_id, state)
+    return job_id, attempt_id
+
+
+def _advance_listing_run_to(
+    repository: Repository,
+    run_id: int,
+    target: ListingRunState,
+) -> None:
+    for state in (
+        ListingRunState.NORMALIZED,
+        ListingRunState.DEDUP_CHECKED,
+        ListingRunState.RULE_EVALUATED,
+        ListingRunState.RAG_RETRIEVED,
+        ListingRunState.AGENT_EVALUATED,
+        ListingRunState.NOTIFICATION_QUEUED,
+    ):
+        repository.advance_listing_run(run_id, state)
+        if state is target:
+            return
+    raise AssertionError(f"unsupported test target {target}")
+
+
 def test_retry_creates_a_new_attempt_without_rewriting_failure(repository) -> None:
     job_id = repository.create_job("rule-1")
     repository.activate_job(job_id)
@@ -469,6 +516,133 @@ def test_stale_listing_run_is_failed_and_retried(
     assert first.state is ListingRunState.FAILED
     assert first.error_summary == "stale process run recovered after restart"
     assert repository.get_listing_run(second_id).run_no == 2
+
+
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        ListingRunState.NORMALIZED,
+        ListingRunState.DEDUP_CHECKED,
+        ListingRunState.RULE_EVALUATED,
+        ListingRunState.RAG_RETRIEVED,
+        ListingRunState.AGENT_EVALUATED,
+    ],
+)
+def test_recover_stale_snapshotted_inflight_run_copies_durable_work(
+    repository: Repository,
+    listing: Listing,
+    stale_state: ListingRunState,
+) -> None:
+    rule = _durable_rule(f"rule-{stale_state.value.lower()}")
+    job_id, attempt_id = _saving_origin(repository, rule.id)
+    run_id, _ = repository.persist_listing_work(
+        listing,
+        rule,
+        origin_job_id=job_id,
+        origin_attempt_id=attempt_id,
+    )
+    _advance_listing_run_to(repository, run_id, stale_state)
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    with repository._engine.begin() as connection:
+        connection.execute(
+            update(ListingProcessRunRow)
+            .where(ListingProcessRunRow.id == run_id)
+            .values(updated_at=stale_at)
+        )
+
+    replacement_ids = repository.recover_stale_listing_work(
+        stale_after=timedelta(seconds=30)
+    )
+
+    assert len(replacement_ids) == 1
+    old = repository.get_listing_run(run_id)
+    replacement = repository.get_listing_run(replacement_ids[0])
+    assert old.state is ListingRunState.FAILED
+    assert old.error_summary == (
+        "crash_recovered: stale in-flight listing work"
+    )
+    assert replacement.listing_id == old.listing_id
+    assert replacement.watch_rule_id == old.watch_rule_id
+    assert replacement.run_no == old.run_no + 1
+    assert replacement.state is ListingRunState.DISCOVERED
+    assert replacement.rule_snapshot_json == old.rule_snapshot_json
+    assert replacement.origin_job_id == old.origin_job_id
+    assert replacement.origin_attempt_id == old.origin_attempt_id
+
+
+def test_recover_stale_listing_work_does_not_steal_fresh_inflight_run(
+    repository: Repository,
+    listing: Listing,
+) -> None:
+    rule = _durable_rule("rule-fresh")
+    job_id, attempt_id = _saving_origin(repository, rule.id)
+    run_id, _ = repository.persist_listing_work(
+        listing,
+        rule,
+        origin_job_id=job_id,
+        origin_attempt_id=attempt_id,
+    )
+    _advance_listing_run_to(
+        repository,
+        run_id,
+        ListingRunState.RAG_RETRIEVED,
+    )
+
+    replacement_ids = repository.recover_stale_listing_work(
+        stale_after=timedelta(hours=1)
+    )
+
+    assert replacement_ids == []
+    assert (
+        repository.get_listing_run(run_id).state
+        is ListingRunState.RAG_RETRIEVED
+    )
+    with repository._sessions() as session:
+        assert session.query(ListingProcessRunRow).count() == 1
+
+
+def test_recover_stale_listing_work_excludes_outbox_owned_run(
+    repository: Repository,
+    listing: Listing,
+) -> None:
+    rule = _durable_rule("rule-outbox-owned")
+    job_id, attempt_id = _saving_origin(repository, rule.id)
+    run_id, _ = repository.persist_listing_work(
+        listing,
+        rule,
+        origin_job_id=job_id,
+        origin_attempt_id=attempt_id,
+    )
+    _advance_listing_run_to(
+        repository,
+        run_id,
+        ListingRunState.AGENT_EVALUATED,
+    )
+    repository.queue_notification_for_run(
+        run_id,
+        decision_version=rule.decision_version,
+        target_session=rule.target_session,
+        message_text="queued",
+    )
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    with repository._engine.begin() as connection:
+        connection.execute(
+            update(ListingProcessRunRow)
+            .where(ListingProcessRunRow.id == run_id)
+            .values(updated_at=stale_at)
+        )
+
+    replacement_ids = repository.recover_stale_listing_work(
+        stale_after=timedelta(seconds=30)
+    )
+
+    assert replacement_ids == []
+    assert (
+        repository.get_listing_run(run_id).state
+        is ListingRunState.NOTIFICATION_QUEUED
+    )
+    with repository._sessions() as session:
+        assert session.query(ListingProcessRunRow).count() == 1
 
 
 @pytest.mark.parametrize(

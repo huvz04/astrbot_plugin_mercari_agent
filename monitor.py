@@ -120,11 +120,14 @@ class CrawlService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = lambda: 0.0,
         attempt_stale_after: timedelta = timedelta(minutes=5),
+        listing_run_stale_after: timedelta = timedelta(minutes=5),
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
         if attempt_stale_after <= timedelta(0):
             raise ValueError("attempt_stale_after must be positive")
+        if listing_run_stale_after <= timedelta(0):
+            raise ValueError("listing_run_stale_after must be positive")
         self._repository = repository
         self._collector = collector
         self._graph = graph
@@ -133,6 +136,7 @@ class CrawlService:
         self._sleep = sleep
         self._jitter = jitter
         self._attempt_stale_after = attempt_stale_after
+        self._listing_run_stale_after = listing_run_stale_after
 
     async def run_once(self, rule: WatchRule) -> int:
         """Create, activate, and run one durable job for *rule*."""
@@ -294,6 +298,9 @@ class CrawlService:
 
     async def drain_pending_listing_work(self) -> list[Exception]:
         """Process safe durable work while isolating failures by run."""
+        self._repository.recover_stale_listing_work(
+            stale_after=self._listing_run_stale_after
+        )
         return await self._process_run_ids(
             [run.id for run in self._repository.pending_listing_work()]
         )
