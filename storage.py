@@ -665,7 +665,31 @@ class Repository:
         origin_attempt_id: int,
         stale_after: timedelta = timedelta(minutes=5),
     ) -> tuple[int, bool]:
-        """Atomically persist a Listing and its recoverable DISCOVERED run."""
+        """Persist durable work, retrying one concurrent uniqueness conflict."""
+        for transaction_attempt in range(2):
+            try:
+                return self._persist_listing_work_once(
+                    listing,
+                    rule,
+                    origin_job_id=origin_job_id,
+                    origin_attempt_id=origin_attempt_id,
+                    stale_after=stale_after,
+                )
+            except IntegrityError:
+                if transaction_attempt == 1:
+                    raise
+        raise AssertionError("unreachable listing persistence retry")
+
+    def _persist_listing_work_once(
+        self,
+        listing: Listing,
+        rule: WatchRule,
+        *,
+        origin_job_id: int,
+        origin_attempt_id: int,
+        stale_after: timedelta,
+    ) -> tuple[int, bool]:
+        """Attempt one atomic Listing and DISCOVERED-run transaction."""
         if stale_after <= timedelta(0):
             raise ValueError("stale_after must be positive")
         try:
@@ -757,7 +781,7 @@ class Repository:
                 session.add(run)
                 session.flush()
                 return run.id, True
-        except (ConcurrentStateChange, IntegrityError):
+        except IntegrityError:
             with self._sessions() as session:
                 existing_listing_id = session.scalar(
                     select(ListingRow.id).where(

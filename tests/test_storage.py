@@ -1,10 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import sqlite3
-from threading import Event
+from threading import Barrier, Event
 
 import pytest
-from sqlalchemy import insert, text, update
+from sqlalchemy import event, insert, text, update
 from sqlalchemy.exc import IntegrityError
 
 from astrbot_plugin_mercari_agent.domain import (
@@ -711,6 +711,138 @@ def test_concurrent_listing_run_get_or_create_returns_one_fresh_run(
         assert run.run_no == 1
         assert run.state is ListingRunState.DISCOVERED
     finally:
+        first_repo.dispose()
+        second_repo.dispose()
+
+
+def test_concurrent_first_listing_persistence_keeps_both_rule_runs(
+    tmp_path,
+    listing: Listing,
+) -> None:
+    database = tmp_path / "first-listing-two-rules.sqlite3"
+    first_repo = Repository.open(database)
+    second_repo = Repository.open(database)
+    first_rule = _durable_rule("rule-concurrent-first")
+    second_rule = _durable_rule("rule-concurrent-second")
+    first_job, first_attempt = _saving_origin(first_repo, first_rule.id)
+    second_job, second_attempt = _saving_origin(
+        second_repo,
+        second_rule.id,
+    )
+    both_at_insert = Barrier(2, timeout=5)
+    first_committed = Event()
+
+    def is_listing_insert(statement: str) -> bool:
+        return statement.lstrip().lower().startswith(
+            "insert into listings "
+        )
+
+    def first_insert_hook(
+        connection,
+        cursor,
+        statement: str,
+        parameters,
+        context,
+        executemany: bool,
+    ) -> None:
+        if is_listing_insert(statement):
+            both_at_insert.wait()
+
+    def second_insert_hook(
+        connection,
+        cursor,
+        statement: str,
+        parameters,
+        context,
+        executemany: bool,
+    ) -> None:
+        if is_listing_insert(statement):
+            both_at_insert.wait()
+            assert first_committed.wait(timeout=5)
+
+    event.listen(
+        first_repo._engine,
+        "before_cursor_execute",
+        first_insert_hook,
+    )
+    event.listen(
+        second_repo._engine,
+        "before_cursor_execute",
+        second_insert_hook,
+    )
+
+    def persist_first() -> tuple[int, bool] | Exception:
+        try:
+            return first_repo.persist_listing_work(
+                listing,
+                first_rule,
+                origin_job_id=first_job,
+                origin_attempt_id=first_attempt,
+            )
+        except Exception as error:
+            return error
+        finally:
+            first_committed.set()
+
+    def persist_second() -> tuple[int, bool] | Exception:
+        try:
+            return second_repo.persist_listing_work(
+                listing,
+                second_rule,
+                origin_job_id=second_job,
+                origin_attempt_id=second_attempt,
+            )
+        except Exception as error:
+            return error
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(persist_first)
+            second_future = executor.submit(persist_second)
+            results = [
+                first_future.result(timeout=10),
+                second_future.result(timeout=10),
+            ]
+        assert all(isinstance(result, tuple) for result in results)
+        successful = [
+            result for result in results if isinstance(result, tuple)
+        ]
+        assert all(created for _, created in successful)
+        assert len({run_id for run_id, _ in successful}) == 2
+        with first_repo._sessions() as session:
+            listings = list(session.query(ListingRow))
+            runs = list(
+                session.query(ListingProcessRunRow).order_by(
+                    ListingProcessRunRow.id
+                )
+            )
+        assert len(listings) == 1
+        assert len(runs) == 2
+        assert {run.watch_rule_id for run in runs} == {
+            first_rule.id,
+            second_rule.id,
+        }
+        expected = {
+            first_rule.id: (first_rule, first_job, first_attempt),
+            second_rule.id: (second_rule, second_job, second_attempt),
+        }
+        for run in runs:
+            rule, job_id, attempt_id = expected[run.watch_rule_id]
+            assert ListingRunState(run.state) is ListingRunState.DISCOVERED
+            assert run.rule_snapshot_json == rule.model_dump_json()
+            assert run.origin_job_id == job_id
+            assert run.origin_attempt_id == attempt_id
+    finally:
+        event.remove(
+            first_repo._engine,
+            "before_cursor_execute",
+            first_insert_hook,
+        )
+        event.remove(
+            second_repo._engine,
+            "before_cursor_execute",
+            second_insert_hook,
+        )
         first_repo.dispose()
         second_repo.dispose()
 
