@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -72,6 +72,91 @@ def test_unknown_attempt_fields_are_rejected(repository) -> None:
     with pytest.raises(ValueError, match="unsupported attempt fields"):
         repository.advance_attempt(
             attempt_id, CrawlAttemptState.REQUESTING, raw_response="secret response body"
+        )
+
+    assert repository.get_attempt(attempt_id).state is CrawlAttemptState.CREATED
+
+
+def test_attempt_field_sanitization_redacts_secrets_and_response_bodies(repository) -> None:
+    job_id = repository.create_job("rule-1")
+    repository.activate_job(job_id)
+    secret_attempts = [repository.create_attempt(job_id) for _ in range(5)]
+    body_attempt = repository.create_attempt(job_id)
+    long_body_attempt = repository.create_attempt(job_id)
+
+    for attempt_id, unsafe_summary in zip(
+        secret_attempts,
+        (
+            "Cookie: session=private-value",
+            "Authorization: Bearer top-secret-token",
+            "token=private-value",
+            "password=private-value",
+            "secret=private-value",
+        ),
+        strict=True,
+    ):
+        repository.advance_attempt(
+            attempt_id,
+            CrawlAttemptState.FAILED,
+            http_status=401,
+            error_type="RequestError",
+            error_summary=unsafe_summary,
+            item_count=0,
+        )
+    repository.advance_attempt(
+        body_attempt,
+        CrawlAttemptState.FAILED,
+        error_summary='{"complete": "response body"}',
+    )
+    repository.advance_attempt(
+        long_body_attempt,
+        CrawlAttemptState.FAILED,
+        error_summary="x" * 241,
+    )
+
+    secret = repository.get_attempt(secret_attempts[0])
+    body = repository.get_attempt(body_attempt)
+    long_body = repository.get_attempt(long_body_attempt)
+    assert secret.http_status == 401
+    assert secret.item_count == 0
+    assert secret.error_type == "RequestError"
+    assert secret.error_summary == "sensitive error detail redacted"
+    for attempt_id in secret_attempts:
+        assert repository.get_attempt(attempt_id).error_summary == "sensitive error detail redacted"
+    assert body.error_summary == "response body omitted"
+    assert long_body.error_summary == "error summary omitted"
+
+
+def test_attempt_timestamps_are_normalized_to_utc_on_read(repository) -> None:
+    job_id = repository.create_job("rule-1")
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+    tokyo_time = datetime(2026, 7, 28, 15, 30, tzinfo=timezone(timedelta(hours=9)))
+
+    repository.advance_attempt(
+        attempt_id,
+        CrawlAttemptState.REQUESTING,
+        started_at=tokyo_time,
+        next_retry_at=tokyo_time,
+    )
+
+    attempt = repository.get_attempt(attempt_id)
+    expected = datetime(2026, 7, 28, 6, 30, tzinfo=timezone.utc)
+    assert attempt.started_at == expected
+    assert attempt.next_retry_at == expected
+    assert attempt.started_at.tzinfo is timezone.utc
+
+
+def test_attempt_timestamps_reject_naive_datetimes(repository) -> None:
+    job_id = repository.create_job("rule-1")
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repository.advance_attempt(
+            attempt_id,
+            CrawlAttemptState.REQUESTING,
+            started_at=datetime(2026, 7, 28, 6, 30),
         )
 
     assert repository.get_attempt(attempt_id).state is CrawlAttemptState.CREATED

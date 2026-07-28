@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, inspect, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from .domain import (
     ATTEMPT_TRANSITIONS,
@@ -32,15 +34,77 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+class UtcDateTime(TypeDecorator[datetime]):
+    """Persist UTC instants in SQLite and restore their timezone on read."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
+        normalized = _as_utc(value)
+        return normalized.replace(tzinfo=None) if normalized is not None else None
+
+    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+_SENSITIVE_ERROR_TEXT = re.compile(
+    r"(?:cookie|authorization|bearer|token|password|secret|set-cookie)", re.IGNORECASE
+)
+
+
+def _sanitize_error_summary(value: object) -> str | None:
+    """Keep a concise diagnostic without retaining credentials or response bodies."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("error_summary must be a string")
+    compact = " ".join(value.split())
+    lowered = compact.lower()
+    if _SENSITIVE_ERROR_TEXT.search(compact):
+        return "sensitive error detail redacted"
+    if (
+        lowered.startswith(("{", "[", "<"))
+        or "response body" in lowered
+        or "<!doctype" in lowered
+    ):
+        return "response body omitted"
+    if len(compact) > 240:
+        return "error summary omitted"
+    return compact or None
+
+
+def _sanitize_error_type(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("error_type must be a string")
+    if _SENSITIVE_ERROR_TEXT.search(value):
+        return "redacted"
+    return "".join(value.split())[:80] or None
+
+
 class CrawlJobRow(Base):
     __tablename__ = "crawl_jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     rule_id: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
 
 class CrawlAttemptRow(Base):
@@ -54,10 +118,10 @@ class CrawlAttemptRow(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     error_type: Mapped[str | None] = mapped_column(String)
     error_summary: Mapped[str | None] = mapped_column(String)
-    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     item_count: Mapped[int | None] = mapped_column(Integer)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
 
 class ListingRow(Base):
@@ -73,8 +137,8 @@ class ListingRow(Base):
     url: Mapped[str] = mapped_column(String, nullable=False)
     image_url: Mapped[str | None] = mapped_column(String)
     seller_name: Mapped[str | None] = mapped_column(String)
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    discovered_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 class ListingProcessRunRow(Base):
@@ -84,7 +148,7 @@ class ListingProcessRunRow(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 class NotificationRow(Base):
@@ -99,7 +163,7 @@ class NotificationRow(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
     watch_rule_id: Mapped[str] = mapped_column(String, nullable=False)
     decision_version: Mapped[str] = mapped_column(String, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 @dataclass(frozen=True)
@@ -115,6 +179,13 @@ class CrawlAttempt:
     job_id: int
     attempt_no: int
     state: CrawlAttemptState
+    http_status: int | None
+    error_type: str | None
+    error_summary: str | None
+    next_retry_at: datetime | None
+    item_count: int | None
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -137,6 +208,9 @@ class Repository:
             "started_at",
             "finished_at",
         }
+    )
+    _ATTEMPT_TIMESTAMP_FIELDS = frozenset(
+        {"next_retry_at", "started_at", "finished_at"}
     )
 
     def __init__(self, engine) -> None:
@@ -201,6 +275,12 @@ class Repository:
         unknown_fields = set(fields) - self._ATTEMPT_FIELDS
         if unknown_fields:
             raise ValueError(f"unsupported attempt fields: {sorted(unknown_fields)}")
+        if "error_type" in fields:
+            fields["error_type"] = _sanitize_error_type(fields["error_type"])
+        if "error_summary" in fields:
+            fields["error_summary"] = _sanitize_error_summary(fields["error_summary"])
+        for name in self._ATTEMPT_TIMESTAMP_FIELDS & fields.keys():
+            fields[name] = _as_utc(fields[name])
         with self._sessions.begin() as session:
             row = session.get(CrawlAttemptRow, attempt_id)
             if row is None:
@@ -226,7 +306,10 @@ class Repository:
                 )
                 if existing is not None:
                     return existing.id, False
-                row = ListingRow(**listing.model_dump())
+                listing_values = listing.model_dump()
+                listing_values["published_at"] = _as_utc(listing_values["published_at"])
+                listing_values["discovered_at"] = _as_utc(listing_values["discovered_at"])
+                row = ListingRow(**listing_values)
                 session.add(row)
                 session.flush()
                 return row.id, True
@@ -287,4 +370,11 @@ class Repository:
             job_id=row.job_id,
             attempt_no=row.attempt_no,
             state=CrawlAttemptState(row.state),
+            http_status=row.http_status,
+            error_type=row.error_type,
+            error_summary=row.error_summary,
+            next_retry_at=row.next_retry_at,
+            item_count=row.item_count,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
         )
