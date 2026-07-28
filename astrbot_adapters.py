@@ -9,9 +9,9 @@ import math
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
+from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context
-from astrbot.core.message.components import MessageChain
 from langchain_core.embeddings import Embeddings
 
 from .domain import AgentDecision, Listing

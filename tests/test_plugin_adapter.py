@@ -69,14 +69,13 @@ def _install_astrbot_stubs() -> None:
 
     api.logger = _Logger()
     event.AstrMessageEvent = object
+    event.MessageChain = _MessageChain
     event.filter = SimpleNamespace(command=_decorator)
     message_components.Plain = _Plain
     star.Context = object
     star.Star = _Star
     star.StarTools = _StarTools
     star.register = _decorator
-    core_components.MessageChain = _MessageChain
-
     modules = {
         "astrbot": astrbot,
         "astrbot.api": api,
