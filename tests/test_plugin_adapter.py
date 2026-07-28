@@ -718,7 +718,9 @@ def test_test_command_falls_back_to_event_unified_msg_origin() -> None:
     result = asyncio.run(_results(plugin.command_test(event)))
 
     assert plugin.crawl_service.rules[0].target_session == "aiocqhttp:group:event"
-    assert plugin.crawl_service.rules[0].id.startswith("default:test:")
+    assert plugin.crawl_service.rules[0].id.startswith(
+        f"{plugin.watch_rule.id}:test:"
+    )
     assert repository.requested_job_ids == [7]
     assert repository.requested_rule_ids == [plugin.crawl_service.rules[0].id]
     assert "SUCCEEDED" in result[0]
@@ -734,6 +736,32 @@ def test_invalid_monitor_price_yields_usage_text(price: str) -> None:
     )
 
     assert result == ["用法：/煤炉监控 <关键词> <最高价>（最高价为非负整数 JPY）"]
+
+
+def test_monitor_command_reuses_identical_rule_identity_and_versions_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_runtime(monkeypatch, tmp_path)
+    plugin = MercariAgentPlugin(FakeContext(), {})
+    event = FakeEvent("aiocqhttp:group:event")
+
+    async def exercise() -> tuple[str, str, str]:
+        await plugin.initialize()
+        await _results(plugin.command_monitor(event, "月村手毬", "1200"))
+        first = plugin.watch_rule.id
+        await _results(plugin.command_monitor(event, "月村手毬", "1200"))
+        repeated = plugin.watch_rule.id
+        await _results(plugin.command_monitor(event, "月村手毬", "1800"))
+        changed = plugin.watch_rule.id
+        await plugin.terminate()
+        return first, repeated, changed
+
+    first, repeated, changed = asyncio.run(exercise())
+
+    assert first == repeated
+    assert changed != first
+    assert first.startswith("mercari-rule-v1-")
 
 
 def test_status_exposes_the_last_sanitized_poll_error() -> None:

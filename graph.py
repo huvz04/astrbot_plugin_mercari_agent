@@ -217,20 +217,16 @@ def build_listing_graph(
                     "precreated listing run does not match listing and rule"
                 )
             run_id = supplied_run.id
-            run_created = supplied_run.state is ListingRunState.DISCOVERED
         else:
-            run_id, run_created = repository.get_or_create_listing_run(
+            run_id, _ = repository.get_or_create_listing_run(
                 listing_id,
                 state["watch_rule"].id,
             )
+        run_created = repository.claim_discovered_listing_run(run_id)
         result["process_run_id"] = run_id
         result["process_run_created"] = run_created
         if run_created:
             try:
-                repository.advance_listing_run(
-                    run_id,
-                    ListingRunState.NORMALIZED,
-                )
                 repository.advance_listing_run(
                     run_id,
                     ListingRunState.DEDUP_CHECKED,
@@ -278,6 +274,11 @@ def build_listing_graph(
         }
         if not set(decision.retrieved_evidence) <= available_evidence:
             raise ValueError("agent cited unavailable evidence")
+        if (
+            decision.prompt_version
+            != state["watch_rule"].decision_version
+        ):
+            raise ValueError("agent decision version does not match rule")
         repository.advance_listing_run(
             state["process_run_id"],
             ListingRunState.AGENT_EVALUATED,

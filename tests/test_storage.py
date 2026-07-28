@@ -20,6 +20,7 @@ from astrbot_plugin_mercari_agent.storage import (
     ConcurrentStateChange,
     CrawlAttemptRow,
     ListingProcessRunRow,
+    ListingRow,
     Repository,
 )
 
@@ -82,6 +83,13 @@ def test_persist_listing_work_atomically_records_rule_and_origin(
     job_id = repository.create_job(rule.id)
     repository.activate_job(job_id)
     attempt_id = repository.create_attempt(job_id)
+    for state in (
+        CrawlAttemptState.REQUESTING,
+        CrawlAttemptState.RECEIVED,
+        CrawlAttemptState.PARSING,
+        CrawlAttemptState.SAVING,
+    ):
+        repository.advance_attempt(attempt_id, state)
 
     run_id, created = repository.persist_listing_work(
         listing,
@@ -100,6 +108,33 @@ def test_persist_listing_work_atomically_records_rule_and_origin(
     assert run.origin_job_id == job_id
     assert run.origin_attempt_id == attempt_id
     assert [work.id for work in repository.pending_listing_work()] == [run_id]
+
+
+def test_persist_listing_work_rejects_invalid_origin_without_saving_listing(
+    repository: Repository,
+    listing: Listing,
+) -> None:
+    rule = WatchRule(
+        id="rule-invalid-origin",
+        name="invalid origin",
+        interval_seconds=60,
+        target_session="session",
+    )
+    job_id = repository.create_job(rule.id)
+    repository.activate_job(job_id)
+    attempt_id = repository.create_attempt(job_id)
+
+    with pytest.raises(ConcurrentStateChange, match="SAVING"):
+        repository.persist_listing_work(
+            listing,
+            rule,
+            origin_job_id=job_id,
+            origin_attempt_id=attempt_id,
+        )
+
+    with repository._sessions() as session:
+        assert session.query(ListingRow).count() == 0
+        assert session.query(ListingProcessRunRow).count() == 0
 
 
 def test_exact_job_and_dispatched_notification_queries_are_scoped(
@@ -488,6 +523,42 @@ def test_concurrent_listing_run_get_or_create_returns_one_fresh_run(
         run = first_repo.get_listing_run(next(iter(run_ids)))
         assert run.run_no == 1
         assert run.state is ListingRunState.DISCOVERED
+    finally:
+        first_repo.dispose()
+        second_repo.dispose()
+
+
+def test_only_one_caller_claims_a_discovered_listing_run(
+    tmp_path,
+    listing: Listing,
+) -> None:
+    database = tmp_path / "listing-run-claim-race.sqlite3"
+    first_repo = Repository.open(database)
+    second_repo = Repository.open(database)
+    listing_id, _ = first_repo.save_listing(listing)
+    run_id, _ = first_repo.get_or_create_listing_run(
+        listing_id,
+        "rule-1",
+    )
+    gate = Event()
+
+    def claim(repo: Repository) -> bool:
+        gate.wait()
+        return repo.claim_discovered_listing_run(run_id)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(claim, first_repo),
+                executor.submit(claim, second_repo),
+            ]
+            gate.set()
+            results = [future.result() for future in futures]
+        assert sorted(results) == [False, True]
+        assert (
+            first_repo.get_listing_run(run_id).state
+            is ListingRunState.NORMALIZED
+        )
     finally:
         first_repo.dispose()
         second_repo.dispose()

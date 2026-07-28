@@ -13,6 +13,7 @@ from astrbot_plugin_mercari_agent.domain import (
     Listing,
     ListingRunState,
     WatchRule,
+    with_stable_rule_id,
 )
 from astrbot_plugin_mercari_agent.filters import evaluate_rule, normalize_listing
 from astrbot_plugin_mercari_agent.graph import build_listing_graph
@@ -141,6 +142,7 @@ def rule() -> WatchRule:
         max_price_jpy=2000,
         interval_seconds=60,
         target_session="aiocqhttp:group:123",
+        decision_version="decision-v1",
     )
 
 
@@ -444,6 +446,44 @@ def test_same_listing_under_different_rules_creates_distinct_runs_and_notificati
     ]
 
 
+def test_relaxed_material_rule_version_reevaluates_a_rejected_listing(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    low_rule = with_stable_rule_id(
+        rule.model_copy(update={"max_price_jpy": listing.price_jpy - 1})
+    )
+    relaxed_rule = with_stable_rule_id(
+        rule.model_copy(update={"max_price_jpy": listing.price_jpy})
+    )
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(
+        repository,
+        RecordingRetriever(),
+        FixedEvaluator(),
+        notifier,
+    )
+
+    rejected = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": low_rule})
+    )
+    accepted = asyncio.run(
+        graph.ainvoke({"listing": listing, "watch_rule": relaxed_rule})
+    )
+
+    assert low_rule.id != relaxed_rule.id
+    assert repository.get_listing_run(
+        rejected["process_run_id"]
+    ).state is ListingRunState.REJECTED
+    assert repository.get_listing_run(
+        accepted["process_run_id"]
+    ).state is ListingRunState.NOTIFIED
+    assert _run_count(repository) == 2
+    assert repository.count_notifications() == 1
+    assert len(notifier.calls) == 1
+
+
 def test_pre_saved_listing_without_a_run_is_still_processed(
     repository: Repository,
     listing: Listing,
@@ -572,3 +612,32 @@ def test_hallucinated_evidence_id_fails_without_queueing_or_dispatch(
     assert repository.count_notifications() == 0
     assert notifier.calls == []
     assert result["errors"] == ["agent cited unavailable evidence"]
+
+
+def test_decision_version_mismatch_fails_without_notification(
+    repository: Repository,
+    listing: Listing,
+    rule: WatchRule,
+) -> None:
+    mismatched_rule = rule.model_copy(
+        update={"decision_version": "decision-v2"}
+    )
+    notifier = RecordingNotifier()
+    graph = build_listing_graph(
+        repository,
+        RecordingRetriever(),
+        FixedEvaluator(),
+        notifier,
+    )
+
+    result = asyncio.run(
+        graph.ainvoke(
+            {"listing": listing, "watch_rule": mismatched_rule}
+        )
+    )
+
+    run = repository.get_listing_run(result["process_run_id"])
+    assert run.state is ListingRunState.FAILED
+    assert run.error_summary == "agent decision version does not match rule"
+    assert repository.count_notifications() == 0
+    assert notifier.calls == []

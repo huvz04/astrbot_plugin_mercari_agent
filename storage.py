@@ -660,6 +660,25 @@ class Repository:
             raise ValueError("stale_after must be positive")
         try:
             with self._sessions.begin() as session:
+                origin_job = session.get(CrawlJobRow, origin_job_id)
+                origin_attempt = session.get(
+                    CrawlAttemptRow,
+                    origin_attempt_id,
+                )
+                if (
+                    origin_job is None
+                    or origin_attempt is None
+                    or origin_attempt.job_id != origin_job_id
+                    or origin_job.rule_id != rule.id
+                    or CrawlJobState(origin_job.state)
+                    is not CrawlJobState.ACTIVE
+                    or CrawlAttemptState(origin_attempt.state)
+                    is not CrawlAttemptState.SAVING
+                ):
+                    raise ConcurrentStateChange(
+                        "listing work origin must be an ACTIVE Job "
+                        "with its SAVING Attempt"
+                    )
                 listing_row = session.scalar(
                     select(ListingRow).where(
                         ListingRow.marketplace == listing.marketplace,
@@ -910,6 +929,23 @@ class Repository:
                 raise ConcurrentStateChange(
                     f"listing process run {run_id} changed concurrently"
                 )
+
+    def claim_discovered_listing_run(self, run_id: int) -> bool:
+        """Atomically claim DISCOVERED work by advancing it to NORMALIZED."""
+        with self._sessions.begin() as session:
+            updated = session.execute(
+                update(ListingProcessRunRow)
+                .where(
+                    ListingProcessRunRow.id == run_id,
+                    ListingProcessRunRow.state
+                    == ListingRunState.DISCOVERED.value,
+                )
+                .values(
+                    state=ListingRunState.NORMALIZED.value,
+                    updated_at=_utc_now(),
+                )
+            )
+            return updated.rowcount == 1
 
     def get_listing_run(self, run_id: int) -> ListingProcessRun:
         with self._sessions() as session:

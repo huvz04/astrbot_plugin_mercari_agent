@@ -19,7 +19,7 @@ from .astrbot_adapters import (
     DeterministicEmbeddings,
     DeterministicEvaluator,
 )
-from .domain import WatchRule
+from .domain import WatchRule, with_stable_rule_id
 from .graph import build_listing_graph, recover_notification_outbox
 from .monitor import CrawlService, MockCollector, Monitor
 from .rag import MarkdownChromaRetriever
@@ -256,19 +256,23 @@ class MercariAgentPlugin(Star):
 
         target = self._target_session or event.unified_msg_origin
         old_rule = self.watch_rule
-        self.watch_rule = WatchRule(
-            id=old_rule.id if old_rule else "default",
-            name=f"{keyword} ≤ {parsed_price} JPY",
-            include_keywords=(keyword,),
-            exclude_keywords=(
-                old_rule.exclude_keywords
-                if old_rule
-                else self._string_tuple("exclude_keywords", ("ジャンク", "欠品"))
-            ),
-            max_price_jpy=parsed_price,
-            interval_seconds=self._poll_interval,
-            target_session=target,
-            enabled=True,
+        self.watch_rule = with_stable_rule_id(
+            WatchRule(
+                id="pending",
+                name=f"{keyword} ≤ {parsed_price} JPY",
+                include_keywords=(keyword,),
+                exclude_keywords=(
+                    old_rule.exclude_keywords
+                    if old_rule
+                    else self._string_tuple(
+                        "exclude_keywords", ("ジャンク", "欠品")
+                    )
+                ),
+                max_price_jpy=parsed_price,
+                interval_seconds=self._poll_interval,
+                target_session=target,
+                enabled=True,
+            )
         )
         if self.monitor is not None:
             await self.monitor.stop()
@@ -348,17 +352,19 @@ class MercariAgentPlugin(Star):
         include_keywords = self._string_tuple(
             "include_keywords", ("月村手毬",)
         )
-        return WatchRule(
-            id="default",
-            name="煤炉默认规则",
-            include_keywords=include_keywords,
-            exclude_keywords=self._string_tuple(
-                "exclude_keywords", ("ジャンク", "欠品")
-            ),
-            max_price_jpy=max_price,
-            interval_seconds=self._poll_interval,
-            target_session=target_session,
-            enabled=True,
+        return with_stable_rule_id(
+            WatchRule(
+                id="pending",
+                name="煤炉默认规则",
+                include_keywords=include_keywords,
+                exclude_keywords=self._string_tuple(
+                    "exclude_keywords", ("ジャンク", "欠品")
+                ),
+                max_price_jpy=max_price,
+                interval_seconds=self._poll_interval,
+                target_session=target_session,
+                enabled=True,
+            )
         )
 
     def _select_evaluator(

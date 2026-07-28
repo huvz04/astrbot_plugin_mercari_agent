@@ -12,11 +12,54 @@ from astrbot_plugin_mercari_agent.domain import (
     Listing,
     ListingRunState,
     TransitionError,
+    WatchRule,
     assert_transition,
+    with_stable_rule_id,
 )
 
 
 class DomainTests(unittest.TestCase):
+    def test_rule_fingerprint_tracks_only_material_configuration(self) -> None:
+        base = WatchRule(
+            id="placeholder",
+            name="base",
+            include_keywords=("缶バッジ", "月村手毬"),
+            exclude_keywords=("欠品", "ジャンク"),
+            max_price_jpy=1500,
+            interval_seconds=60,
+            target_session="aiocqhttp:group:123",
+        )
+        versioned = with_stable_rule_id(base)
+        reordered = with_stable_rule_id(
+            base.model_copy(
+                update={
+                    "id": "another-placeholder",
+                    "name": "renamed",
+                    "include_keywords": tuple(reversed(base.include_keywords)),
+                    "exclude_keywords": tuple(reversed(base.exclude_keywords)),
+                    "interval_seconds": 3600,
+                    "enabled": False,
+                }
+            )
+        )
+
+        self.assertEqual(versioned.id, reordered.id)
+        self.assertTrue(versioned.id.startswith("mercari-rule-v1-"))
+        for field, value in (
+            ("include_keywords", ("藤田ことね",)),
+            ("exclude_keywords", ("破損",)),
+            ("max_price_jpy", 2500),
+            ("target_session", "aiocqhttp:group:456"),
+            ("marketplace", "mercari-jp"),
+            ("collector_identity", "mock-collector-v2"),
+            ("decision_version", "mercari-v2"),
+        ):
+            with self.subTest(field=field):
+                changed = with_stable_rule_id(
+                    base.model_copy(update={field: value})
+                )
+                self.assertNotEqual(versioned.id, changed.id)
+
     def test_attempt_can_progress_but_cannot_rewind(self) -> None:
         assert_transition(
             CrawlAttemptState.REQUESTING,

@@ -14,10 +14,10 @@ from astrbot.api.message_components import Plain
 from astrbot.api.star import Context
 from langchain_core.embeddings import Embeddings
 
-from .domain import AgentDecision, Listing
+from .domain import AgentDecision, DEFAULT_DECISION_VERSION, Listing
 from .rag import Evidence
 
-_PROMPT_VERSION = "mercari-v1"
+_PROMPT_VERSION = DEFAULT_DECISION_VERSION
 _RISK_TERMS = ("ジャンク", "欠品", "破損", "偽物", "risk", "风险")
 T = TypeVar("T")
 

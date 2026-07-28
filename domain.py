@@ -4,9 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import hashlib
+import json
 from typing import Literal, TypeVar
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+DEFAULT_MARKETPLACE = "mercari"
+MOCK_COLLECTOR_IDENTITY = "mock-collector-v1"
+DEFAULT_DECISION_VERSION = "mercari-v1"
+_RULE_ID_PREFIX = "mercari-rule-v1-"
 
 
 class CrawlJobState(StrEnum):
@@ -160,6 +169,44 @@ class WatchRule(DomainValue):
     interval_seconds: int = Field(ge=1)
     target_session: str
     enabled: bool = True
+    marketplace: str = DEFAULT_MARKETPLACE
+    collector_identity: str = MOCK_COLLECTOR_IDENTITY
+    decision_version: str = DEFAULT_DECISION_VERSION
+
+
+def _canonical_rule_keywords(values: tuple[str, ...]) -> list[str]:
+    return sorted(
+        {
+            " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+            for value in values
+            if " ".join(unicodedata.normalize("NFKC", value).split())
+        }
+    )
+
+
+def with_stable_rule_id(rule: WatchRule) -> WatchRule:
+    """Return *rule* with a stable ID derived from material behavior."""
+    material = {
+        "collector_identity": rule.collector_identity.strip(),
+        "decision_version": rule.decision_version.strip(),
+        "exclude_keywords": _canonical_rule_keywords(
+            rule.exclude_keywords
+        ),
+        "include_keywords": _canonical_rule_keywords(
+            rule.include_keywords
+        ),
+        "marketplace": rule.marketplace.strip(),
+        "max_price_jpy": rule.max_price_jpy,
+        "target_session": rule.target_session.strip(),
+    }
+    payload = json.dumps(
+        material,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return rule.model_copy(update={"id": f"{_RULE_ID_PREFIX}{digest[:32]}"})
 
 
 class Listing(DomainValue):
