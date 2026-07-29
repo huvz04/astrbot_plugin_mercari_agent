@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import unittest
 
 from pydantic import ValidationError
@@ -19,6 +20,13 @@ from astrbot_plugin_mercari_agent.domain import (
 
 
 class DomainTests(unittest.TestCase):
+    def test_states_remain_plain_string_values(self) -> None:
+        state = CrawlJobState.PENDING
+
+        self.assertIsInstance(state, str)
+        self.assertEqual(str(state), "PENDING")
+        self.assertEqual(json.dumps({"state": state}), '{"state": "PENDING"}')
+
     def test_rule_fingerprint_tracks_only_material_configuration(self) -> None:
         base = WatchRule(
             id="placeholder",

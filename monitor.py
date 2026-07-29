@@ -504,5 +504,5 @@ class Monitor:
     async def _wait(self, delay: float) -> None:
         try:
             await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             return
