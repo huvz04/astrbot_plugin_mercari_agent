@@ -1,140 +1,67 @@
 # 煤炉捡漏 Agent
 
-这是一个可安装到 AstrBot 4.16+ 的离线可测试插件骨架。当前已经连通了
-SQLite 持久化、Chroma 知识检索、LangGraph 决策编排和 AstrBot 通知调用；但
-**当前只提供 `MockCollector`，不会访问 Mercari 网络，也不是生产抓取器**。
-将 `use_mock_collector` 关闭后，插件会记录警告且不会启动后台监控。
+![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6C5CE7)
+![Python](https://img.shields.io/badge/Python-%3E%3D3.11-3776AB)
+![Release](https://img.shields.io/badge/release-0.1.0-2EA44F)
 
-## 运行链路
+一个面向 AstrBot 的煤炉（Mercari）关键词监控插件骨架：用状态机管理采集与重试，
+用 Markdown + Chroma 补充商品知识，再由 LangGraph 生成可解释的通知判断。
 
-```text
-AstrBot 定时调度 / 手动命令
-  -> CrawlService：Job、Attempt、重试和采集
-  -> SQLite：任务、尝试、Listing、每规则处理记录、通知记录
-  -> 确定性标准化与硬过滤（关键词、排除词、价格）
-  -> Markdown -> Chroma：别名与风险知识检索
-  -> LangGraph：检索、结构化评估、通知入队、通知调用
-  -> AstrBot Context.send_message：主动消息
-```
+> 当前只提供离线 `MockCollector`，不会访问 Mercari 网络，也不是生产爬虫。
 
-采集、重试和硬过滤是普通的确定性代码：它们有明确输入、可重放状态和可预测
-规则。RAG/Agent 只处理这些确定性步骤不适合承担的内容，例如商品别名、风险
-知识和可解释的评估理由；它不会替代价格/关键词等硬约束。
+## 主要功能
 
-离线验收能证明通知已提交给匹配的 AstrBot 平台，且本地通知记录进入 `SENT`；
-它**不能**证明 QQ 已经送达。QQ 的真实送达只能由目标平台回执或可见消息证明。
+- 单调状态机管理采集任务、失败重试和崩溃恢复
+- SQLite 持久化商品、去重结果和通知 outbox
+- 确定性关键词、排除词与价格过滤
+- Markdown + Chroma 检索谷子别名、品相、交易和物流知识
+- LangGraph 编排检索、评估与 AstrBot 主动通知
 
-## 三个单调状态机
+## 安装
 
-- **Job**：`PENDING -> ACTIVE -> SUCCEEDED | EXHAUSTED | CANCELLED`。
-- **Attempt**：`CREATED -> REQUESTING -> RECEIVED -> PARSING -> SAVING -> SUCCEEDED`；
-  任一允许阶段可进入 `FAILED`。可重试失败不会倒退或复用 Attempt，而是由同一个
-  Job 创建一个新的 Attempt。
-- **每规则 ListingProcessRun**：`DISCOVERED -> NORMALIZED -> DEDUP_CHECKED ->
-  RULE_EVALUATED -> RAG_RETRIEVED -> AGENT_EVALUATED -> NOTIFICATION_QUEUED ->
-  NOTIFIED`；硬过滤可终止为 `REJECTED`，异常可终止为 `FAILED`。失败或陈旧的
-  非终态运行会以递增 `run_no` 创建新记录；`NOTIFIED`/`REJECTED` 才抑制重处理。
-- **Notification outbox**：`QUEUED -> SENDING -> SENT | FAILED_KNOWN |
-  VERIFY_REQUIRED`。明确失败可由新处理运行安全重排；发送结果不确定时进入
-  `VERIFY_REQUIRED`，不会自动重发。
-
-## 安装与依赖
-
-将本目录放到 AstrBot 的插件目录：
+将本目录放入 AstrBot 插件目录：
 
 ```text
 AstrBot/data/plugins/astrbot_plugin_mercari_agent
 ```
 
-在该目录中安装依赖：
+安装依赖并重载插件：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-随后重启或在 AstrBot 中重载插件。不要把 Provider 密钥、Cookie 或平台凭据写入
-插件配置、README 或日志。
+首次使用建议保持 `enabled=false`、`use_mock_collector=true`，先执行 `/煤炉测试`。
 
-## 配置
+## 使用
 
-首次使用推荐保守配置：`enabled=false`、`use_mock_collector=true`，先通过
-`/煤炉测试` 验证本地链路。
+- `/煤炉状态`：查看监控开关、规则及最近任务状态。
+- `/煤炉测试`：运行一次离线 MockCollector 流程。
+- `/煤炉监控 <关键词> <最高价>`：设置规则并启动监控。
+- `/煤炉暂停`：停止后台监控。
+- `/煤炉恢复`：恢复有效的 MockCollector 监控。
 
-| 字段 | 作用 | 安全的首次建议 |
-| --- | --- | --- |
-| `enabled` | 是否在初始化后启动后台监控 | `false` |
-| `poll_interval_seconds` | 轮询间隔（代码下限为 10 秒） | `60` |
-| `max_attempts` | 每个 Job 的最多尝试次数（代码限制 1–5） | `3` |
-| `recovery_stale_after_seconds` | 崩溃恢复陈旧阈值（代码下限 30 秒） | `300` |
-| `target_session` | AstrBot `unified_msg_origin` 主动通知目标 | 留空，先在当前会话测试 |
-| `include_keywords` | 必须命中的默认关键词 | `["月村手毬"]` |
-| `exclude_keywords` | 命中即跳过的关键词 | `["ジャンク", "欠品"]` |
-| `max_price_jpy` | 最高可接受价格（JPY） | `3000` |
-| `use_mock_collector` | 使用离线 MockCollector | `true`，当前唯一可运行模式 |
-| `allow_external_providers` | 是否允许内容发送到外部 Chat/Embedding Provider | `false` |
-| `embedding_provider_id` | 外部 Embedding Provider ID | 外部 Provider 关闭时留空 |
+## 常用配置
 
-## 命令
+| 配置 | 说明 |
+| --- | --- |
+| `enabled` | 初始化后是否自动启动监控 |
+| `use_mock_collector` | 使用离线 MockCollector；当前应保持 `true` |
+| `target_session` | 主动通知目标的 `unified_msg_origin` |
+| `include_keywords` | 必须命中的关键词 |
+| `exclude_keywords` | 命中后跳过的关键词 |
+| `max_price_jpy` | 最高价格，单位 JPY |
+| `allow_external_providers` | 是否允许把商品和知识内容发送给外部 Provider |
 
-- `/煤炉状态`：查看开关、监控状态、规则和最近 Job/Attempt。
-- `/煤炉测试`：只运行一次 MockCollector；没有目标会话时使用当前会话。
-- `/煤炉监控 <关键词> <最高价>`：替换内存规则并启动监控。
-- `/煤炉暂停`：幂等停止后台监控。
-- `/煤炉恢复`：仅在有效规则且 `use_mock_collector=true` 时恢复监控。
+## 知识库
 
-## Provider 与离线回退
+[`knowledge/`](knowledge/) 已按商品别名、交易话术、品相、物流和风险原则拆分。
+新增一级 Markdown 文件后，现有 RAG 加载器会自动将它纳入 Chroma 索引。
 
-`allow_external_providers` 默认是 `false`；此时即使 AstrBot 已配置 Provider，
-插件也始终使用确定性本地 Embedding 和本地评估器。
+## 说明
 
-只有显式改为 `true` 后，插件才会复用 AstrBot Provider。届时：
-
-- 商品标题、描述以及检索到的知识片段会发送给所选 Chat Provider 进行评估；
-- 本地 Markdown 知识片段会发送给所选 Embedding Provider 建立向量索引；
-- 检索查询中的商品标题和描述也会发送给该 Embedding Provider。
-
-`embedding_provider_id` 指定 Embedding Provider；留空时选第一个可用项。插件不
-新增或保存 Provider 密钥。启用前应确认这些商品和知识内容允许外发，并查看所选
-Provider 的数据处理政策。
-
-## 离线测试
-
-先安装运行时与开发依赖：
-
-```powershell
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-dev.txt
-```
-
-然后运行：
-
-```powershell
-python -m pytest astrbot_plugin_mercari_agent/tests -v -p no:cacheprovider
-python -m compileall -q astrbot_plugin_mercari_agent
-```
-
-这些测试不需要 Mercari、AstrBot 安装、Provider 凭据或网络。验收测试会使用真实
-SQLite、Chroma、编译后的 LangGraph、重试状态转换、去重和通知幂等；通知器只是
-离线记录调用。
-
-## 本地数据、隐私与日志
-
-AstrBot 的插件数据目录中会创建 `mercari_agent.db`（任务、Attempt、Listing、
-处理记录和通知 outbox）以及 `chroma/`（按语料和 Embedding 指纹隔离的持久化
-集合）。Listing 标题、描述、价格、URL 与通知文本会进入本地数据库；请按自己的
-数据保留策略保护或清理该目录。错误摘要会做敏感字段脱敏，采集响应正文不会写入
-数据库。日志不应包含凭据、Cookie 或访问令牌；如需排障，也请先移除敏感数据。
-
-## 接入真实 Collector 的边界
-
-未来如需接入真实来源，应在 `Collector.collect(rule) -> list[Listing]` 边界实现一个
-独立 Collector，并保留 CrawlService 的状态、重试、保存和 Graph 的去重/通知链路。
-这需要合法的平台访问方式、授权与对平台条款/频率限制的审查；不要尝试绕过访问
-控制、反爬机制或认证。当前 MockCollector 不是生产抓取，也不应据此宣称已经实现
-Mercari 生产采集。
-
-## 面试表述
-
-可如实描述为：在受约束的 RAG/Agent 工作流外层，用确定性状态机与数据工程保证
-采集任务、重试、持久化、去重和通知幂等；RAG/Agent 负责别名、风险知识与可解释
-评估。不要将 MockCollector 描述成生产爬虫，也不要把离线通知调用描述成 QQ 已送达。
+- 真实 Collector 应接在现有 `Collector.collect()` 边界，并遵守数据来源的授权、
+  平台条款和频率限制；不要绕过认证、访问控制或反爬机制。
+- `allow_external_providers=false` 时使用本地确定性 Embedding 与评估器；启用外部
+  Provider 前请确认商品描述和知识内容允许外发。
+- 本地通知进入 `SENT` 只表示调用已提交，不能证明 QQ 最终送达。
