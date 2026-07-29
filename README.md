@@ -1,7 +1,7 @@
 # 煤炉捡漏 Agent
 
 ![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6C5CE7)
-![Python](https://img.shields.io/badge/Python-%3E%3D3.11-3776AB)
+![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)
 ![Release](https://img.shields.io/badge/release-0.1.0-2EA44F)
 
 一个面向 AstrBot 的煤炉（Mercari）关键词监控插件骨架：用状态机管理采集与重试，

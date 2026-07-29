@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum
 import hashlib
 import json
 from typing import Literal, TypeVar
@@ -18,7 +18,14 @@ DEFAULT_DECISION_VERSION = "mercari-v1"
 _RULE_ID_PREFIX = "mercari-rule-v1-"
 
 
-class CrawlJobState(StrEnum):
+class StringEnum(str, Enum):
+    """String-valued enum with consistent behavior on Python 3.10+."""
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class CrawlJobState(StringEnum):
     PENDING = "PENDING"
     ACTIVE = "ACTIVE"
     SUCCEEDED = "SUCCEEDED"
@@ -26,7 +33,7 @@ class CrawlJobState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
-class CrawlAttemptState(StrEnum):
+class CrawlAttemptState(StringEnum):
     CREATED = "CREATED"
     REQUESTING = "REQUESTING"
     RECEIVED = "RECEIVED"
@@ -36,7 +43,7 @@ class CrawlAttemptState(StrEnum):
     FAILED = "FAILED"
 
 
-class ListingRunState(StrEnum):
+class ListingRunState(StringEnum):
     DISCOVERED = "DISCOVERED"
     NORMALIZED = "NORMALIZED"
     DEDUP_CHECKED = "DEDUP_CHECKED"
@@ -49,7 +56,7 @@ class ListingRunState(StrEnum):
     FAILED = "FAILED"
 
 
-class NotificationState(StrEnum):
+class NotificationState(StringEnum):
     QUEUED = "QUEUED"
     SENDING = "SENDING"
     SENT = "SENT"
@@ -141,7 +148,7 @@ class TransitionError(ValueError):
     """Raised when a state machine is asked to move backward or skip a state."""
 
 
-State = TypeVar("State", bound=StrEnum)
+State = TypeVar("State", bound=StringEnum)
 
 
 def assert_transition(
