@@ -256,7 +256,8 @@ def test_markdown_retriever_returns_stable_source_metadata(
 
     assert evidence
     assert evidence[0].document_id
-    assert evidence[0].document_id in {"aliases", "risk_terms"}
+    source_ids = {path.stem for path in knowledge_dir.glob("*.md")}
+    assert all(item.document_id in source_ids for item in evidence)
 
 
 def test_markdown_retriever_reopens_without_duplicates_and_isolates_embeddings(
@@ -305,12 +306,36 @@ def test_markdown_retriever_reopens_without_duplicates_and_isolates_embeddings(
 
 def test_knowledge_files_define_all_required_terms() -> None:
     knowledge_dir = Path(__file__).parents[1] / "knowledge"
+    files = {path.stem: path for path in knowledge_dir.glob("*.md")}
+    assert {
+        "aliases",
+        "trade_terms",
+        "condition_terms",
+        "shipping_terms",
+        "risk_terms",
+    } <= files.keys()
+
     text = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted(knowledge_dir.glob("*.md"))
+        for path in sorted(files.values())
     )
 
-    for term in ("缶バッジ", "アクスタ", "未開封", "ジャンク", "欠品", "バラ売り不可"):
+    for term in (
+        "缶バッジ",
+        "アクスタ",
+        "ぬいぐるみ",
+        "紙類",
+        "即購入",
+        "バラ売り不可",
+        "専用",
+        "未開封",
+        "初期傷",
+        "ジャンク",
+        "欠品",
+        "送料込み",
+        "着払い",
+        "普通郵便",
+    ):
         assert term in text
 
 
